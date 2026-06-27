@@ -1,0 +1,53 @@
+# Virtual environment
+**/venv/
+**/.venv/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+.Python
+
+# Environment files 
+.env
+
+# Logs
+*.log
+logs/
+
+# IDE/editor
+.vscode/
+ideas/
+tasks/
+interesting/
+workbook/
+tests/
+README_ru.md
+README.md
+*.swp
+*.swo
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# LLM models
+**/models/*
+!**/models/.gitkeep
+
+# Data bases
+data_bases/
+
+# llama.cpp
+llama.cpp/build/
+llama.cpp/CMakeCache.txt
+llama.cpp/CMakeFiles/
+
+# Drivers
+drivers/
