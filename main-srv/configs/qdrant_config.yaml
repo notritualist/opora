@@ -1,0 +1,25 @@
+log_level: INFO
+
+storage:
+  storage_path: "/qdrant/storage"
+  snapshots_path: "/qdrant/snapshots"
+
+  performance:
+    max_search_threads: 2
+
+  optimizers:
+    deleted_threshold: 0.2
+    vacuum_min_vector_number: 1000
+    default_segment_number: 2
+    memmap_threshold: 10000
+
+  wal:
+    wal_capacity_mb: 1024
+    wal_segments_ahead: 1
+
+service:
+  http_port: 6333
+  grpc_port: 6334
+
+cluster:
+  enabled: false

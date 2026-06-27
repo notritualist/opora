@@ -1,0 +1,40 @@
+# /mnt/work/opora/main-srv/configs/docker-compose.yml
+
+services:
+  postgres_db:
+    image: pgvector/pgvector:0.8.3-pg18-trixie
+    container_name: postgres_opora_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust  # временно, для упрощения
+    volumes:
+      - postgres_opora_nvme_data:/var/lib/postgresql
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    ports:
+      - "5435:5432"
+    command: >
+      postgres
+      -c config_file=/etc/postgresql/postgresql.conf
+      -c hba_file=/etc/postgresql/pg_hba.conf
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  qdrant: 
+    image: qdrant/qdrant:v1.18.2
+    container_name: qdrant_opora_db
+    restart: unless-stopped 
+    volumes: 
+      - /mnt/data_bases/opora/qdrant_data:/qdrant/storage 
+      - /mnt/data_bases/opora/qdrant_snapshots:/qdrant/snapshots
+      - /mnt/work/opora/main-srv/configs/qdrant_config.yaml:/qdrant/config/production.yaml 
+    ports: 
+      - "6335:6333" 
+      - "6336:6334" 
+
+volumes:
+  postgres_opora_nvme_data:
+    external: true
