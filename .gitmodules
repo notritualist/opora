@@ -1,0 +1,3 @@
+[submodule "main-srv/llama.cpp"]
+	path = main-srv/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp
