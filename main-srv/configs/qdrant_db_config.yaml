@@ -1,0 +1,3 @@
+# /main-srv/configs/qdrant_config.yaml
+host: "localhost"
+port: 6335

@@ -1,0 +1,6 @@
+database:
+  host: "localhost"
+  port: 5435
+  dbname: "opora_db"
+  user: "opora"
+  password: "123"

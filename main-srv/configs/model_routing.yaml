@@ -1,0 +1,66 @@
+# main-srv/configs/model_routing.yaml
+
+# === Правила роутинга: модель → провайдер ===
+routing:
+  rules:
+    # Локальные GGUF-модели
+    - pattern: "*.gguf"
+      provider: "local_llama"
+      priority: 100
+    
+    # Qwen через DashScope (если включено)
+    - pattern: "qwen-plus"
+      provider: "dashscope"
+      priority: 90
+      enabled: false  # по умолчанию отключено
+    
+    - pattern: "qwen-max"
+      provider: "dashscope"
+      enabled: false
+    
+    # Fallback: всё остальное → локальный провайдер
+    - pattern: "*"
+      provider: "local_llama"
+      priority: 1
+
+# === Конфигурация провайдеров ===
+providers:
+  local_llama:
+    enabled: true
+    type: "llama_server"
+    base_url: "http://main-srv:8081/v1/chat/completions"
+    timeout: 120
+    retry:
+      max_attempts: 3
+      backoff_seconds: 1.0
+    models:
+      Qwen3.5-9B-Q4_K_M.gguf:
+        path: "/mnt/work/kaya/main-srv/models/qwen3_5/Qwen3.5-9B-Q4_K_M.gguf"
+        n_ctx: 262144
+        supports_reasoning: true  # возвращает reasoning_content отдельно
+
+  dashscope:
+    enabled: false
+    type: "openai_compatible"
+    base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+    api_key_env: "DASHSCOPE_API_KEY"  # брать из env, не хранить в конфиге
+    timeout: 60
+    retry:
+      max_attempts: 2
+      backoff_seconds: 0.5
+    models:
+      qwen-plus:
+        n_ctx: 32768
+        supports_reasoning: true
+      qwen-max:
+        n_ctx: 32768
+        supports_reasoning: true
+
+# === Глобальные настройки ===
+defaults:
+  queue:
+    enabled: false
+    max_size: 10
+  logging:
+    request_body: false  # не логировать тела запросов (безопасность)
+    response_body: false
