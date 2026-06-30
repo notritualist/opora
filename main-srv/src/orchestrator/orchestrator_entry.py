@@ -2,16 +2,17 @@
 main-srv/src/orchestrator/orchestrator_entry.py
 
 Входной интерфейс оркестратора.
-
 Единая точка входа для создания задач оркестратора.
-Все модули (session_manager, lifecycle_manager) должны использовать этот интерфейс вместо прямого SQL INSERT.
+Все модули (session_manager, lifecycle_manager, memory_service) должны использовать этот интерфейс вместо прямого SQL INSERT.
 Поддерживаемые типы задач:
 - user_answer_generation: генерация финального ответа пользователю.
+- memory_extraction: извлечение гипотез из закрытых диалогов в долговременную память.
 Архитектура:
-- Универсальная функция create_orchestrator_task().
-- Специализированная обёртка: on_user_message.
+- Универсальная функция create_orchestrator_task() с валидацией task_type.
+- Специализированные обёртки: on_user_message, schedule_memory_extraction.
 Интеграция с жизненным циклом:
 - Активность фиксируется с actor_id из сообщения.
+- Агент-версия передаётся глобально через version.py.
 """
 
 __version__ = "1.1.0"
@@ -120,6 +121,44 @@ def on_user_message(message_id: str) -> str:
     finally:
         if conn:
             conn.close()
+
+def schedule_memory_extraction(
+    actor_id: Optional[str] = None,
+    message_ids: Optional[list] = None,
+    priority: float = 0.3
+) -> str:
+    """
+    Создаёт задачу извлечения гипотез в долговременную память.
+    Вызывается оркестратором при переходе в sleep или вручную.
+    
+    Логика:
+    1. Формирование input_data (mode: auto / explicit).
+    2. Делегирование в create_orchestrator_task() с валидацией типа задачи.
+    3. Возврат UUID созданной задачи.
+    
+    Args:
+        actor_id: если указан — анализировать только этого пользователя
+        message_ids: если указан — конкретные сообщения (иначе автовыборка из БД)
+        priority: приоритет задачи (по умолчанию 0.3 — ниже ответа пользователю)
+        
+    Returns:
+        str: UUID созданной задачи
+        
+    Raises:
+        RuntimeError: если тип задачи не найден или ошибка БД
+    """
+    input_data: Dict[str, Any] = {"mode": "auto"}
+    if actor_id:
+        input_data["actor_id"] = actor_id
+    if message_ids:
+        input_data["message_ids"] = message_ids
+        input_data["mode"] = "explicit"
+    
+    return create_orchestrator_task(
+        task_type_name="memory_extraction",
+        input_data=input_data,
+        priority=priority
+    )
 
 def create_orchestrator_task(
     task_type_name: str,

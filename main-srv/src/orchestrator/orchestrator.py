@@ -4,10 +4,18 @@ main-srv/src/orchestrator/orchestrator.py
 Главный цикл оркестратора задач AGI.
 Возможности:
 - Одиночный фоновый поток с безопасным получением задач (FOR UPDATE SKIP LOCKED).
-- Контроль параллелизма: одна задача генерации за раз через флаг _composer_busy.
-- Обработчики задач: user_answer_generation.
+- Контроль параллелизма: одна задача за раз через флаг _composer_busy.
+- Проверка зависимостей: задачи с parent_task_id ждут завершения родителя.
+- Обработчики задач: user_answer_generation, memory_extraction (тонкие обёртки).
 - Отказоустойчивость: ошибки логируются, цикл продолжается.
-- Интеграция с жизненным циклом: проверка таймаутов неактивности и диалогов на каждом пульсе.
+- Интеграция с жизненным циклом: проверка таймаутов неактивности и диалогов.
+Архитектура:
+- Оркестратор работает как daemon-поток, запускаемый из main.py.
+- Задачи создаются через orchestrator_entry.
+- Обработчики — тонкие обёртки, делегирующие работу в композеры:
+  * user_answer_generation → response_composer.py
+  * memory_extraction → memory_composer.py
+- Метрики обновляются через service_metrics.
 """
 
 __version__ = "1.1.0"
@@ -165,6 +173,33 @@ def _handle_answer_generation(task_id: str, input_data: dict) -> None:
         with _composer_lock:
             _composer_busy = False
 
+def _handle_memory_extraction(task_id: str, input_data: dict) -> None:
+    """
+    Обработчик задачи извлечения гипотез в долговременную память.
+    Запускается в отдельном потоке.
+    Логика:
+    1. Импортирует compose_memory_extraction внутри функции (защита от циклических импортов).
+    2. Вызывает композер.
+    3. При ошибке — завершает задачу как failed.
+    4. Всегда сбрасывает флаг занятости в finally.
+    """
+    global _composer_busy
+    try:
+        from memory_service.memory_composer import compose_memory_extraction
+        compose_memory_extraction(task_id=task_id, input_data=input_data)
+    except Exception as exc:
+        logger.exception(
+            "Error in memory_composer (task_id=%s): %s", task_id[:8], exc
+        )
+        complete_task_error(
+            task_id=task_id,
+            error_module="memory_composer",
+            error_message=str(exc)
+        )
+    finally:
+        with _composer_lock:
+            _composer_busy = False
+
 def _get_task_type_name(db_config: dict, task_id: str) -> str:
     """Возвращает type_name задачи по её ID."""
     with psycopg2.connect(**db_config) as conn:
@@ -220,9 +255,60 @@ def _orchestrator_loop():
             lifecycle_mgr.check_inactivity()
             check_dialogue_timeouts(db_config)
             
+            # === ПЛАНИРОВАНИЕ АНАЛИЗА ПАМЯТИ В РЕЖИМЕ SLEEP ===
+            # Создаём задачу ТОЛЬКО если:
+            # 1. Нет активной задачи (pending/running)
+            # 2. Есть необработанные сообщения в закрытых диалогах
+            try:
+                current_state = lifecycle_mgr._get_global_lifecycle()
+                if current_state and current_state['state_type'] == 'sleep':
+                    has_unprocessed = None  # ← Инициализация для Pylance
+                    
+                    with psycopg2.connect(**db_config) as conn:
+                        with conn.cursor() as cur:
+                            # Проверка 1: есть ли активная задача
+                            cur.execute("""
+                                SELECT 1 FROM orchestrator.orchestrator_tasks t
+                                JOIN orchestrator.task_types tt ON t.task_type_id = tt.id
+                                WHERE tt.type_name = 'memory_extraction'
+                                AND t.status IN ('pending'::task_status, 'running'::task_status)
+                                LIMIT 1
+                            """)
+                            has_active = cur.fetchone()
+                            
+                            # Проверка 2: есть ли необработанные сообщения
+                            if not has_active:
+                                cur.execute("""
+                                    SELECT 1
+                                    FROM dialogs.row_messages rm
+                                    JOIN dialogs.dialogues d ON rm.dialogue_id = d.id
+                                    WHERE d.status = 'completed'
+                                    AND NOT EXISTS (
+                                        SELECT 1 FROM memory.message_analyses ma 
+                                        WHERE ma.message_id = rm.id
+                                    )
+                                    LIMIT 1
+                                """)
+                                has_unprocessed = cur.fetchone()
+                    
+                    if not has_active and has_unprocessed:
+                        from orchestrator.orchestrator_entry import schedule_memory_extraction
+                        task_id = schedule_memory_extraction(priority=0.3)
+                        logger.info(
+                            "Scheduled memory_extraction during sleep: %s", 
+                            task_id[:8]
+                        )
+            except Exception as e:
+                logger.warning("Failed to schedule memory_extraction: %s", e)
+
             if not _composer_busy:
-                # === ИЗВЛЕЧЕНИЕ ЗАДАЧИ ===
+                # === ИЗВЛЕЧЕНИЕ ЗАДАЧИ ПО ПРИОРИТЕТУ СВЕРХУ ВНИЗ===
+                # 1. Ответ пользователю (высший приоритет)
                 task = _get_pending_task(db_config, "user_answer_generation")
+            
+                # 2. Извлечение гипотез (фоновая задача, низкий приоритет)
+                if not task:
+                    task = _get_pending_task(db_config, "memory_extraction")
                 
                 if task:
                     task_id = task["id"]
@@ -237,6 +323,7 @@ def _orchestrator_loop():
                     # Маппинг типов → обработчиков
                     handlers: Dict[str, Callable] = {
                         "user_answer_generation": _handle_answer_generation,
+                        "memory_extraction": _handle_memory_extraction,
                     }
                     
                     target = handlers.get(task_type)

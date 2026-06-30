@@ -1,7 +1,7 @@
 # /mnt/work/opora/pyproject.toml
 [project]
 name = "Opora"
-version = "1.1.0"
+version = "1.2.0"
 description = "AGI system with multi-server architecture"
 authors = [
     {name = "Notritualist", email = "notritualist@gmail.com"}
