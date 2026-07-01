@@ -1,5 +1,5 @@
 """
-main-srv/src/phs_service/lifecycle_manager.py
+main-srv/src/services/lifecycle_manager.py
 
 Глобальный менеджер жизненного цикла агента.
 Принципы:

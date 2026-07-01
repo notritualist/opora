@@ -1,3 +1,4 @@
+#/main-srv/scripts/start_llama-server.sh
 #!/bin/bash
 # Start Qwen3.5-9b at llama-server
 
