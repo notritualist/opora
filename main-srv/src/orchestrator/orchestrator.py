@@ -6,9 +6,15 @@ main-srv/src/orchestrator/orchestrator.py
 - Одиночный фоновый поток с безопасным получением задач (FOR UPDATE SKIP LOCKED).
 - Контроль параллелизма: одна задача за раз через флаг _composer_busy.
 - Проверка зависимостей: задачи с parent_task_id ждут завершения родителя.
-- Обработчики задач: user_answer_generation, memory_extraction (тонкие обёртки).
-- Отказоустойчивость: ошибки логируются, цикл продолжается.
 - Интеграция с жизненным циклом: проверка таймаутов неактивности и диалогов.
+- Автоматическое планирование фоновых задач в режиме sleep (memory_extraction, verification_proposal).
+
+Обработчики задач:
+- user_answer_generation → response_composer.py
+- memory_extraction → memory_composer.py
+- verification_proposal → verification_composer.py (инициация верификации через NOTIFY)
+- hypothesis_refinement → verification_composer.py (LLM-уточнение)
+
 Архитектура:
 - Оркестратор работает как daemon-поток, запускаемый из main.py.
 - Задачи создаются через orchestrator_entry.
@@ -18,7 +24,7 @@ main-srv/src/orchestrator/orchestrator.py
 - Метрики обновляются через service_metrics.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __description__ = "AGI Agent Task Orchestrator"
 
 import threading
@@ -200,6 +206,32 @@ def _handle_memory_extraction(task_id: str, input_data: dict) -> None:
         with _composer_lock:
             _composer_busy = False
 
+def _handle_verification_proposal(task_id: str, input_data: dict) -> None:
+    """Обработчик задачи инициации верификации. Делегирует в verification_composer."""
+    global _composer_busy
+    try:
+        from memory_service.verification_composer import compose_verification_proposal
+        compose_verification_proposal(task_id=task_id, input_data=input_data)
+    except Exception as exc:
+        logger.exception("Error in verification_proposal (task_id=%s): %s", task_id[:8], exc)
+        complete_task_error(task_id=task_id, error_module="verification_composer", error_message=str(exc))
+    finally:
+        with _composer_lock:
+            _composer_busy = False
+
+def _handle_hypothesis_refinement(task_id: str, input_data: dict) -> None:
+    """Обработчик задачи LLM-уточнения гипотезы."""
+    global _composer_busy
+    try:
+        from memory_service.verification_composer import compose_hypothesis_refinement
+        compose_hypothesis_refinement(task_id=task_id, input_data=input_data)
+    except Exception as exc:
+        logger.exception("Error in hypothesis_refinement (task_id=%s): %s", task_id[:8], exc)
+        complete_task_error(task_id=task_id, error_module="verification_composer", error_message=str(exc))
+    finally:
+        with _composer_lock:
+            _composer_busy = False
+
 def _get_task_type_name(db_config: dict, task_id: str) -> str:
     """Возвращает type_name задачи по её ID."""
     with psycopg2.connect(**db_config) as conn:
@@ -229,7 +261,7 @@ def load_pulse_seconds(db_config: dict) -> int:
         logger.warning("Failed to load orchestrator_pulse_seconds from DB, using default=1")
         return 1
 
-def _orchestrator_loop():
+def _orchestrator_loop(lifecycle_mgr: LifecycleManager):
     """
     Основной цикл оркестратора.
     На каждом пульсе:
@@ -241,12 +273,9 @@ def _orchestrator_loop():
     Задачи с parent_task_id пропускаются, если родитель не завершён.
     """
     global _composer_busy, _running
-
     db_config = load_postgres_config()
     pulse_seconds = load_pulse_seconds(db_config)
-    # Инициализация lifecycle manager
-    lifecycle_mgr = LifecycleManager(db_config)
-
+   
     logger.info("Orchestrator started. Pulse interval: %d second(s)", pulse_seconds)
 
     while _running:
@@ -255,60 +284,96 @@ def _orchestrator_loop():
             lifecycle_mgr.check_inactivity()
             check_dialogue_timeouts(db_config)
             
-            # === ПЛАНИРОВАНИЕ АНАЛИЗА ПАМЯТИ В РЕЖИМЕ SLEEP ===
-            # Создаём задачу ТОЛЬКО если:
-            # 1. Нет активной задачи (pending/running)
-            # 2. Есть необработанные сообщения в закрытых диалогах
+            # === ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ДЛЯ PYLANCE ===
+            current_state = None
             try:
                 current_state = lifecycle_mgr._get_global_lifecycle()
-                if current_state and current_state['state_type'] == 'sleep':
-                    has_unprocessed = None  # ← Инициализация для Pylance
-                    
+            except Exception as e:
+                logger.warning("Failed to get global lifecycle state: %s", e)
+
+            # === ПЛАНИРОВАНИЕ ФОНОВЫХ ЗАДАЧ В РЕЖИМЕ SLEEP ===
+            if current_state and current_state.get('state_type') == 'sleep':
+                
+                # 1. Планирование memory_extraction
+                try:
                     with psycopg2.connect(**db_config) as conn:
                         with conn.cursor() as cur:
-                            # Проверка 1: есть ли активная задача
                             cur.execute("""
                                 SELECT 1 FROM orchestrator.orchestrator_tasks t
                                 JOIN orchestrator.task_types tt ON t.task_type_id = tt.id
                                 WHERE tt.type_name = 'memory_extraction'
-                                AND t.status IN ('pending'::task_status, 'running'::task_status)
+                                  AND t.status IN ('pending'::task_status, 'running'::task_status)
                                 LIMIT 1
                             """)
-                            has_active = cur.fetchone()
+                            has_active_extraction = cur.fetchone()
                             
-                            # Проверка 2: есть ли необработанные сообщения
-                            if not has_active:
+                            if not has_active_extraction:
                                 cur.execute("""
                                     SELECT 1
                                     FROM dialogs.row_messages rm
                                     JOIN dialogs.dialogues d ON rm.dialogue_id = d.id
                                     WHERE d.status = 'completed'
-                                    AND NOT EXISTS (
-                                        SELECT 1 FROM memory.message_analyses ma 
-                                        WHERE ma.message_id = rm.id
-                                    )
+                                      AND NOT EXISTS (
+                                          SELECT 1 FROM memory.message_analyses ma 
+                                          WHERE ma.message_id = rm.id
+                                      )
                                     LIMIT 1
                                 """)
                                 has_unprocessed = cur.fetchone()
-                    
-                    if not has_active and has_unprocessed:
-                        from orchestrator.orchestrator_entry import schedule_memory_extraction
-                        task_id = schedule_memory_extraction(priority=0.3)
-                        logger.info(
-                            "Scheduled memory_extraction during sleep: %s", 
-                            task_id[:8]
-                        )
-            except Exception as e:
-                logger.warning("Failed to schedule memory_extraction: %s", e)
+                                
+                                if has_unprocessed:
+                                    from orchestrator.orchestrator_entry import schedule_memory_extraction
+                                    task_id = schedule_memory_extraction(priority=0.3)
+                                    logger.info("Scheduled memory_extraction during sleep: %s", task_id[:8])
+                except Exception as e:
+                    logger.warning("Failed to schedule memory_extraction: %s", e)
 
+                # 2. Планирование verification_proposal
+                try:
+                    with psycopg2.connect(**db_config) as conn:
+                        with conn.cursor() as cur:
+                            # Проверка 1: нет ли уже активной задачи proposal
+                            cur.execute("""
+                                SELECT 1 FROM orchestrator.orchestrator_tasks t
+                                JOIN orchestrator.task_types tt ON t.task_type_id = tt.id
+                                WHERE tt.type_name = 'verification_proposal'
+                                  AND t.status IN ('pending'::task_status, 'running'::task_status)
+                                LIMIT 1
+                            """)
+                            has_active_proposal = cur.fetchone()
+                            
+                            # Проверка 2: нет ли активной или отложенной сессии верификации
+                            cur.execute("""
+                                SELECT 1 FROM memory.verification_sessions
+                                WHERE (status = 'active'::memory.verification_session_status)
+                                   OR (status = 'deferred'::memory.verification_session_status AND deferred_until > NOW())
+                                LIMIT 1
+                            """)
+                            has_active_session = cur.fetchone()
+                            
+                            if not has_active_proposal and not has_active_session:
+                                # Проверка 3: есть ли draft гипотезы
+                                cur.execute("""
+                                    SELECT 1 FROM memory.hypotheses 
+                                    WHERE status = 'draft'::memory.hypothesis_status 
+                                    LIMIT 1
+                                """)
+                                has_drafts = cur.fetchone()
+                                
+                                if has_drafts:
+                                    from orchestrator.orchestrator_entry import schedule_verification_proposal
+                                    schedule_verification_proposal(priority=0.2)
+                                    logger.info("Scheduled verification_proposal during sleep")
+                except Exception as e:
+                    logger.warning("Failed to schedule verification_proposal: %s", e)
+                        
+            # === ДИСПЕТЧЕРИЗАЦИЯ ЗАДАЧ ===
             if not _composer_busy:
-                # === ИЗВЛЕЧЕНИЕ ЗАДАЧИ ПО ПРИОРИТЕТУ СВЕРХУ ВНИЗ===
-                # 1. Ответ пользователю (высший приоритет)
+                # Приоритеты: 1. Ответ пользователю, 2. Уточнение гипотезы, 3. Извлечение памяти, 4. Proposal
                 task = _get_pending_task(db_config, "user_answer_generation")
-            
-                # 2. Извлечение гипотез (фоновая задача, низкий приоритет)
-                if not task:
-                    task = _get_pending_task(db_config, "memory_extraction")
+                if not task: task = _get_pending_task(db_config, "hypothesis_refinement")
+                if not task: task = _get_pending_task(db_config, "memory_extraction")
+                if not task: task = _get_pending_task(db_config, "verification_proposal")
                 
                 if task:
                     task_id = task["id"]
@@ -324,6 +389,8 @@ def _orchestrator_loop():
                     handlers: Dict[str, Callable] = {
                         "user_answer_generation": _handle_answer_generation,
                         "memory_extraction": _handle_memory_extraction,
+                        "verification_proposal": _handle_verification_proposal,
+                        "hypothesis_refinement": _handle_hypothesis_refinement,
                     }
                     
                     target = handlers.get(task_type)
@@ -348,7 +415,7 @@ def _orchestrator_loop():
             logger.exception("Critical error in orchestrator loop: %s", exc)
             time.sleep(pulse_seconds)
 
-def start_orchestrator() -> threading.Thread | None:
+def start_orchestrator(lifecycle_mgr: LifecycleManager) -> threading.Thread | None:
     """
     Запускает оркестратор в фоновом потоке.
     Выполняет очистку зависших записей перед стартом.
@@ -366,7 +433,12 @@ def start_orchestrator() -> threading.Thread | None:
     _cleanup_dangling_records(db_config)
 
     _running = True
-    thread = threading.Thread(target=_orchestrator_loop, daemon=True, name="Orchestrator")
+    thread = threading.Thread(
+        target=_orchestrator_loop,
+        args=(lifecycle_mgr,),
+        daemon=True,
+        name="Orchestrator"
+    )
     thread.start()
 
     logger.info("Orchestrator background thread started")

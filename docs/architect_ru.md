@@ -44,10 +44,11 @@ agent/
 │        ├── db_manager/          # Управление БД
 │        │   ├── __init__.py
 │        │   ├── db_manager.py    # Подключение к PostgreSQL (использует postgres_db_config.yaml)
-│        │   └── migrations/
+│        │   └── migrations/      # Миграции Postgres
 │        │       ├── __init__.py
 │        │       ├── pg_migration_manager.py         # Менеджер применения миграций БД
-│        │       └── V001_initial.sql                # Начальная схема (основные таблицы агента)
+│        │       ├── V001_initial.sql                # Начальная схема (основные таблицы агента)
+│        │       └── V002_verification.sql           # Подсистема верификации гипотез
 │        │
 │        ├── dialog_services/     # Управление жизненным циклом диалогов
 │        │   ├── __init__.py
@@ -57,10 +58,12 @@ agent/
 │        │   ├── __init__.py
 │        │   └── console_interface.py  # Консольный UI
 │        │
-│        ├── memory_service/      # Подсистема долговременной памяти агента (ТОЛЬКО 3 ФАЙЛА)
+│        ├── memory_service/      # Подсистема долговременной памяти агента
 │        │   ├── __init__.py
-│        │   ├── hypothesis_service.py  # Единый модуль работы с гипотезами
-│        │   └── memory_composer.py     # Выполнение задачи извлечения гипотез
+│        │   ├── hypothesis_service.py   # Единый модуль работы с гипотезами
+│        │   ├── memory_composer.py      # Выполнение задачи извлечения гипотез
+│        │   ├── verification_service.py # Управление сессиями верификации гипотез
+│        │   └── verification_composer.py # Выполнение задач верификации гипотез
 │        │
 │        ├── model_service/       # Абстракция доступа к LLM с роутингом
 │        │   ├── __init__.py
@@ -76,6 +79,7 @@ agent/
 │        │   ├── orchestrator_entry.py   # Точка входа: создание задач из внешних событий
 │        │   ├── orchestrator.py         # Фоновый цикл: выбор и диспетчеризация задач
 │        │   └── response_composer.py    # Генерация финального ответа через ModelService
+│        │
 │        │
 │        ├── services/            # Вспомогательные сервисы
 │        │   ├── __init__.py

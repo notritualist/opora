@@ -3,19 +3,24 @@ main-srv/src/orchestrator/orchestrator_entry.py
 
 Входной интерфейс оркестратора.
 Единая точка входа для создания задач оркестратора.
-Все модули (session_manager, lifecycle_manager, memory_service) должны использовать этот интерфейс вместо прямого SQL INSERT.
+Все модули (session_manager, lifecycle_manager, memory_service, verification_service) должны использовать этот интерфейс вместо прямого SQL INSERT.
+
 Поддерживаемые типы задач:
 - user_answer_generation: генерация финального ответа пользователю.
 - memory_extraction: извлечение гипотез из закрытых диалогов в долговременную память.
+- verification_proposal: проверка наличия draft-гипотез и отправка NOTIFY в UI.
+- hypothesis_refinement: LLM-уточнение гипотезы по комментарию пользователя.
+
 Архитектура:
 - Универсальная функция create_orchestrator_task() с валидацией task_type.
-- Специализированные обёртки: on_user_message, schedule_memory_extraction.
+Специализированные обёртки: on_user_message, schedule_memory_extraction, schedule_verification_proposal, schedule_hypothesis_refinement.
+
 Интеграция с жизненным циклом:
 - Активность фиксируется с actor_id из сообщения.
 - Агент-версия передаётся глобально через version.py.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __description__ = "Entry point for orchestrator"
 
 import logging
@@ -160,6 +165,14 @@ def schedule_memory_extraction(
         priority=priority
     )
 
+def schedule_verification_proposal(priority: float = 0.2) -> str:
+    """Создаёт задачу проверки необходимости верификации."""
+    return create_orchestrator_task(
+        task_type_name="verification_proposal",
+        input_data={"mode": "auto"},
+        priority=priority
+    )
+
 def create_orchestrator_task(
     task_type_name: str,
     input_data: Dict[str, Any],
@@ -231,3 +244,23 @@ def create_orchestrator_task(
     except psycopg2.Error as e:
         logger.error(f"Database error creating orchestrator task: {e}", exc_info=True)
         raise RuntimeError(f"Failed to create orchestrator task: {e}") from e
+
+# Константа приоритета для очереди оркестратора
+HYPOTHESIS_REFINEMENT_PRIORITY = 0.6
+
+def schedule_hypothesis_refinement(
+    hypothesis_id: str,
+    user_comment: str,
+    verification_session_id: str,
+    priority: float = HYPOTHESIS_REFINEMENT_PRIORITY,
+) -> str:
+    """Создаёт задачу LLM-уточнения гипотезы."""
+    return create_orchestrator_task(
+        task_type_name="hypothesis_refinement",
+        input_data={
+            "hypothesis_id": hypothesis_id,
+            "user_comment": user_comment,
+            "verification_session_id": verification_session_id,
+        },
+        priority=priority,
+    )

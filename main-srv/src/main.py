@@ -78,8 +78,8 @@ def main():
     2. Загрузка и проверка схемы БД Postgres
     3. Загрузка и проверка коллекции Qdrant
     4. Очистка зависших после рестарта сессий пользователей
-    5. Запуск цикла оркестратора
-    6. Инициализация LifecycleManager
+    5. Инициализация LifecycleManager
+    . Запуск цикла оркестратора
     7. Запуск консольного интерфейса с передачей lifecycle_mgr
     """
     # Инициализация логгирования
@@ -107,12 +107,15 @@ def main():
 
         # 4. Очистка зависших до рестарта сессий
         SessionManager.close_dangling_sessions(postgres_config)
+        # Очистка зависших сессий верификации + закрытие их задач оркестратора
+        from memory_service.verification_service import close_dangling_verification_sessions
+        close_dangling_verification_sessions(postgres_config)
                 
-        # 5. Запуск цикла оркестратора
-        start_orchestrator()
-
-        # 6. Инициализация LifecycleManager
+        # 5. Инициализация LifecycleManager
         lifecycle_mgr = LifecycleManager(postgres_config)
+        
+        # 6. Запуск цикла оркестратора
+        start_orchestrator(lifecycle_mgr)
 
         # 7. Запуск консольного интерфейса с передачей конфига БД и версии агента
         run_console_interface(postgres_config, agent_version, lifecycle_mgr)

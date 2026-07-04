@@ -186,6 +186,25 @@ class LifecycleManager:
                 if not row or row[0] is None:
                     return default
                 return float(row[0])
+            
+    def _get_shutdown_types_from_db(self) -> list[str]:
+        """
+        Получает список значений ENUM state.shutdown_type из базы данных.
+        Источник истины — БД, никакого хардкода в Python.
+        Returns:
+            list[str]: список значений enum в порядке определения (enumsortorder)
+        """
+        with psycopg2.connect(**self.db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT e.enumlabel
+                    FROM pg_enum e
+                    JOIN pg_type t ON e.enumtypid = t.oid
+                    JOIN pg_namespace n ON t.typnamespace = n.oid
+                    WHERE n.nspname = 'state' AND t.typname = 'shutdown_type'
+                    ORDER BY e.enumsortorder
+                """)
+                return [row[0] for row in cur.fetchall()]
 
     # =========================================================================
     # ПУБЛИЧНЫЕ МЕТОДЫ ДЛЯ ОРКЕСТРАТОРА
@@ -283,28 +302,7 @@ class LifecycleManager:
                 """, (actor_id, shutdown_type, datetime.now(timezone.utc)))
                 row = cur.fetchone()
                 return str(row['id'])
-
-    def _prompt_shutdown_reason(self) -> str:
-        print("\nAgent was offline. Please specify the reason:")
-        reasons = {
-            'maintenance': 'Scheduled equipment maintenance',
-            'crash': 'Crash',
-            'forced_shutdown': 'Forced shutdown',
-            'user_absence': 'Long-term absence of the user',
-            'agent_modification': 'Agent refinement and testing'
-        }
-        for i, (enum_val, desc) in enumerate(reasons.items(), start=1):
-            print(f"  [{i}] {desc}")
-
-        enum_list = list(reasons.keys())
-        import sys
-        while True:
-            print("Your choice (1-5):   ", end="  ", flush=True)
-            choice = sys.stdin.readline().strip()
-            if choice.isdigit() and 1 <= int(choice) <= len(enum_list):
-                return enum_list[int(choice) - 1]
-            print("Invalid choice. Please try again.")
-
+    
     def _get_shutdown_type_by_id(self, shutdown_id: str) -> Optional[str]:
         with psycopg2.connect(**self.db_config) as conn:
             with conn.cursor() as cur:
@@ -313,76 +311,59 @@ class LifecycleManager:
                 """, (shutdown_id,))
                 row = cur.fetchone()
                 return row[0] if row else None
-
-    def handle_startup(self, actor_id: str) -> None:
+    
+    def handle_startup(self, actor_id: str, shutdown_type: Optional[str] = None) -> None:
         """
         Вызывается при запуске. Корректно различает штатный старт и креш.
-    
-        Логика:
-        1. Если есть запись с ended_at=NULL:
-        - state_type='off' → штатный старт. Закрываем off, стартуем active.
-        - state_type='active'/'sleep' → креш. Запрашиваем причину, КОНВЕРТИРУЕМ запись в off (без дублирования), стартуем active.
-        2. Если нет активной записи → стартуем active.
+        Args:
+            actor_id: UUID актора-инициатора.
+            shutdown_type: Причина выключения для зависшего состояния.
+                         Если не передан и обнаружен креш, используется 'crash'.
+                         Менеджер НИКОГДА не запрашивает ввод — это ответственность UI.
         """
         logger.info("Starting lifecycle recovery...")
-        
         current = self._get_global_lifecycle()
-
         if current is None:
             self._start_new_lifecycle(actor_id, 'startup', 'active')
             return
-
         state_type = current['state_type']
-        downtime_start = current['started_at']
-        downtime_duration = (datetime.now(timezone.utc) - downtime_start).total_seconds()
         now = datetime.now(timezone.utc)
-
-        # === ИСПРАВЛЕНИЕ: off с ended_at=NULL — это штатное выключение ===
         if state_type == 'off':
-            logger.info(
-                f"Detected graceful shutdown state: off (id={current['id'][:8]}). "
-                f"Closing and starting active."
-            )
-
+            logger.info(f"Detected graceful shutdown state: off (id={current['id'][:8]}). "
+                        f"Closing and starting active.")
             shutdown_id = current.get('shutdown_reason_id')
-            shutdown_type = None
+            shutdown_type_existing = None
             if shutdown_id:
-                shutdown_type = self._get_shutdown_type_by_id(shutdown_id)
-            
-            if not shutdown_type:
+                shutdown_type_existing = self._get_shutdown_type_by_id(shutdown_id)
+            if not shutdown_type_existing:
                 logger.warning("No shutdown_reason_id in off state.")
-
             self._close_global_lifecycle('startup')
             self._start_new_lifecycle(actor_id, 'startup', 'active')
             return
-
         # === active или sleep с ended_at=NULL — это креш ===
         if state_type in ('active', 'sleep'):
             logger.warning(f"Detected dangling lifecycle state: {state_type}. Treating as crash.")
-        
-            shutdown_type = self._prompt_shutdown_reason()
+            # Если shutdown_type не передан из UI, используем дефолт 'crash'
+            if shutdown_type is None:
+                shutdown_type = 'crash'
+                logger.info("No shutdown_type provided, defaulting to 'crash'")
             shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
-            
-            # Конвертируем запись в off
             self._convert_to_off(current['id'], shutdown_id, now)
             self._start_new_lifecycle(actor_id, 'startup', 'active')
             return
-
-    def handle_graceful_shutdown(self, actor_id: str, exit_reason: str) -> None:
+    
+    def handle_graceful_shutdown(self, actor_id: str, exit_reason: str, shutdown_type: str) -> None:
         """
         Обрабатывает штатное выключение агента.
-
         Выполняет закрытие lifecycle и переход в off.
         Args:
             actor_id: UUID актора, инициировавшего выключение.
             exit_reason: Причина выхода (user_exit, user_command).
+            shutdown_type: Тип выключения из ENUM state.shutdown_type.
+                         Обязательный аргумент. Менеджер не запрашивает ввод.
         """
-        logger.info(f"Handling graceful shutdown (reason: {exit_reason})...")
-
-        # === Закрытие lifecycle ===
-        shutdown_type = self._prompt_shutdown_reason()
+        logger.info(f"Handling graceful shutdown (reason: {exit_reason}, type: {shutdown_type})...")
         shutdown_id = self._record_shutdown_reason(shutdown_type, actor_id)
-
         self._close_global_lifecycle('shutdown_command')
         self._start_new_lifecycle(actor_id, 'shutdown_command', 'off', shutdown_id)
         logger.info("Graceful shutdown completed.")
