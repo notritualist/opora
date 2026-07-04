@@ -1,0 +1,24 @@
+[Unit]
+Description=Embedding Server
+After=network.target
+
+[Service]
+Type=exec
+User=user
+WorkingDirectory=/mnt/emb-srv
+Environment=PATH=/mnt/emb-srv/.venv/bin
+ExecStart=/mnt/emb-srv/.venv/bin/uvicorn src.main:app --host 192.168.100.3 --port 8000
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Graceful shutdown
+KillSignal=SIGTERM
+SendSIGKILL=yes
+KillMode=mixed
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

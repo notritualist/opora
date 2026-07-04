@@ -1,0 +1,7 @@
+# /main-srv/configs/emb_srv__config.yaml
+# Version: 1.0.0
+# Настройки доступа к серверу эмбендингов
+
+server:
+  host: "192.168.100.3"
+  port: 8000

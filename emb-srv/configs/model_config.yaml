@@ -1,0 +1,8 @@
+# Embanding LLM static model parameters
+# /emb-srv/configs/model_config.yaml
+# Version: 1.0.0
+
+model_path: "/mnt/emb-srv/models/Qwen3-Embedding-4B-Q4_K_M.gguf"
+n_gpu_layers: 36
+n_ctx: 16384
+embedding_dim: 2560 # Не влияет на динамику, только для контроля размера вектора в возврате сервера

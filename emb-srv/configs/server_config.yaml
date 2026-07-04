@@ -1,0 +1,8 @@
+# Server parameters
+# /emb-srv/configs/server_config.yaml
+# Version: 1.0.0
+# Настройки прописаны в systetmd запуск через uvicorn. Здесь продублированы для сведения.
+
+server:
+  host: "192.168.100.3"
+  port: 8000

@@ -5,6 +5,23 @@ agent/
 ├── .gitignore                   # Игнорируемые файлы
 ├── .gitmodules                  # Импортированные модули
 │
+├── emb-srv/                      # Сервер эмбеддингов
+│    ├── .venv/                   # Виртуальное окружение Python
+│    ├── configs/
+│    │   ├── model_config.yaml    # Конфигурация параметров модели
+│    │   └── server_config.yaml   # Сетевые настройки сервера
+│    │
+│    ├── models/                  # LLM модели (игнорируется git)
+│    │   └── Qwen3-Embedding-4B-Q4_K_M.gguf
+│    │
+│    ├── src/
+│    │   └── main.py              # FastAPI приложение с эндпоинтом /embed
+│    │
+│    ├── systemd/
+│    │   └── embedding-server.service  # Systemd-юнит для автозапуска службы
+│    │
+│    └── requirements.txt         # Файл зависимостей .venv
+│
 ├── main-srv/                    # Основной сервер
 │    ├── .venv/                  # Виртуальное окружение Python
 │    ├── configs/
@@ -13,7 +30,8 @@ agent/
 │    │   ├── pg_hba.conf          # Правила аутентентификации PostgreSQL
 │    │   ├── qdrant_config.yaml   # Конфигурация Qdrant
 │    │   ├── postgres_db_config.yaml  # Конфигурация PostgreSQL (подключение к БД)
-│    │   └── model_routing.yaml   # Конфигурация роутинга LLM моделей
+│    │   ├── model_routing.yaml   # Конфигурация роутинга LLM моделей
+│    │   └── emb_srv_config.yaml  # Настройки доступа к серверу эмбеддингов
 │    │
 │    ├── llama.cpp/              # Субмодуль llama.cpp (форк)
 │    │   ├── CMakeLists.txt
@@ -30,7 +48,7 @@ agent/
 │    │   └── qwen3_5-tokenizer/
 │    │       └── tokenizer.json   # Токенизатор для Qwen3.5
 │    │
-│    ├── requirements.txt        # Файл зависимостей .venv (main-srv)
+│    ├── requirements.txt        # Файл зависимостей .venv
 │    │
 │    ├── scripts/
 │    │   ├── start-db.sh          # Скрипт запуска всех БД
