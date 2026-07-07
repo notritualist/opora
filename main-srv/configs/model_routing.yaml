@@ -29,7 +29,7 @@ providers:
     enabled: true
     type: "llama_server"
     base_url: "http://main-srv:8081/v1/chat/completions"
-    timeout: 120
+    timeout: 1200
     retry:
       max_attempts: 3
       backoff_seconds: 1.0
@@ -44,7 +44,7 @@ providers:
     type: "openai_compatible"
     base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
     api_key_env: "DASHSCOPE_API_KEY"  # брать из env, не хранить в конфиге
-    timeout: 60
+    timeout: 120
     retry:
       max_attempts: 2
       backoff_seconds: 0.5

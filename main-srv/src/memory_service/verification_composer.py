@@ -24,7 +24,7 @@ orchestrator.prompts, orchestrator.orchestrator_steps, orchestrator.orchestrator
 metrics.llm_internal, metrics.llm_artifacts, orchestrator.reasonings.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __description__ = "Composer for verification and hypothesis refinement tasks"
 
 import json
@@ -95,10 +95,10 @@ def compose_verification_proposal(task_id: str, input_data: dict) -> None:
                     complete_task_success(task_id, {"reason": "session_active_or_deferred"})
                     return
                 
-                # Проверка 2: draft-гипотезы (ID и count для payload)
+                # Проверка 2: needs_clarification гипотезы (ID и count для payload)
                 cur.execute("""
                     SELECT id FROM memory.hypotheses
-                    WHERE status = 'draft'::memory.hypothesis_status
+                    WHERE status = 'needs_clarification'::memory.hypothesis_status
                     ORDER BY confidence DESC, created_at ASC
                     LIMIT 200
                 """)
@@ -148,12 +148,13 @@ def compose_hypothesis_refinement(task_id: str, input_data: dict) -> None:
     try:
         hypothesis_id = input_data["hypothesis_id"]
         user_comment = input_data["user_comment"]
+        metadata_updates = input_data.get("metadata_updates") or {}
 
         # Получаем hypothesis_text, actor_id и source_message_ids из БД
         with psycopg2.connect(**db_config) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT hypothesis_text, actor_id, source_message_ids
+                    SELECT hypothesis_text, source_message_ids
                     FROM memory.hypotheses
                     WHERE id = %s::uuid
                 """, (hypothesis_id,))
@@ -161,7 +162,6 @@ def compose_hypothesis_refinement(task_id: str, input_data: dict) -> None:
                 if not hyp_row:
                     raise RuntimeError(f"Hypothesis {hypothesis_id} not found")
                 hypothesis_text = hyp_row['hypothesis_text']
-                actor_id = str(hyp_row['actor_id'])
                 source_message_ids = hyp_row['source_message_ids'] or []
         
         # Получаем source_context из сообщений-источников
@@ -287,41 +287,77 @@ def compose_hypothesis_refinement(task_id: str, input_data: dict) -> None:
                 content_type="reflection"
             )
         
-        # 8. Создание verification_action ПОСЛЕ LLM (здесь уже есть step_id и prompt_id)
+        # === 8. Атомарное обновление гипотезы и создание verification_action ===
         verification_session_id = input_data.get("verification_session_id")
         verification_action_id = None
         if verification_session_id:
             with psycopg2.connect(**db_config) as conn:
                 with conn.cursor() as cur:
+                    # Обновляем текст гипотезы
+                    cur.execute("""
+                        UPDATE memory.hypotheses
+                        SET hypothesis_text = %s,
+                            status = 'confirmed'::memory.hypothesis_status,
+                            updated_at = NOW(),
+                            verified_at = NOW()
+                        WHERE id = %s::uuid
+                    """, (refined_text, hypothesis_id))
+                    
+                    # === НОВОЕ: Обновляем метаданные, если переданы ===
+                    if metadata_updates:
+                        update_fields = []
+                        update_params = []
+                        if 'domain_code' in metadata_updates:
+                            update_fields.append("domain_code = %s")
+                            update_params.append(metadata_updates['domain_code'])
+                        if 'knowledge_source' in metadata_updates:
+                            update_fields.append("knowledge_source = %s")
+                            update_params.append(metadata_updates['knowledge_source'])
+                        if 'topic_id' in metadata_updates:
+                            update_fields.append("topic_id = %s::uuid")
+                            update_params.append(metadata_updates['topic_id'])
+                        
+                        if update_fields:
+                            update_params.append(hypothesis_id)
+                            cur.execute(f"""
+                                UPDATE memory.hypotheses
+                                SET {', '.join(update_fields)}, updated_at = NOW()
+                                WHERE id = %s::uuid
+                            """, update_params)
+                    
+                    # Формируем итоговый комментарий с пометкой об изменении метаданных
+                    final_comment = user_comment or ""
+                    if metadata_updates:
+                        meta_note = f"[metadata: {', '.join(f'{k}={v}' for k, v in metadata_updates.items())}]"
+                        final_comment = f"{final_comment} {meta_note}".strip()
+                    
+                    # Создаём verification_action
                     cur.execute("""
                         INSERT INTO memory.verification_actions (
-                            session_id, hypothesis_id, actor_id, action_type,
+                            session_id, hypothesis_id, action_type,
                             original_text, updated_text, user_comment,
                             orchestrator_step_id, prompt_id
                         ) VALUES (
-                            %s::uuid, %s::uuid, %s::uuid,
-                            'edited'::memory.verification_action_type,
+                            %s::uuid, %s::uuid, 'edited'::memory.verification_action_type,
                             %s, %s, %s, %s::uuid, %s::uuid
                         )
                         RETURNING id
                     """, (
-                        verification_session_id, hypothesis_id, actor_id,
-                        hypothesis_text, refined_text, user_comment,
+                        verification_session_id, hypothesis_id,
+                        hypothesis_text, refined_text, final_comment,
                         step_id, prompt_id
                     ))
                     verification_action_id = str(cur.fetchone()[0])
                     conn.commit()
-
-        # 9. Завершение шага и задачи: output — ТОЛЬКО verification_action_id
+        
         output_data = {
             "refined_text": refined_text,
             "verification_action_id": verification_action_id,
+            "metadata_updated": bool(metadata_updates),
         }
-        complete_step_success(step_id, output_data)
+        complete_step_success(step_id, output_data, llm_metric_id=llm_metric_id)
         complete_task_success(task_id, output_data)
-        
         logger.info("Hypothesis refined successfully: task=%s", task_id[:8])
-        
     except Exception as exc:
         logger.exception("Error in compose_hypothesis_refinement (task=%s): %s", task_id[:8], exc)
         if step_id:

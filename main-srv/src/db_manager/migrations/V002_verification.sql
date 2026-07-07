@@ -24,7 +24,6 @@ COMMENT ON TYPE memory.verification_session_status IS 'Статус сессии
 -- Блок 2: Таблицы
 CREATE TABLE IF NOT EXISTS memory.verification_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    actor_id UUID NOT NULL REFERENCES users.actors(id) ON DELETE CASCADE,
     status memory.verification_session_status NOT NULL DEFAULT 'active',
     hypotheses_total INT NOT NULL DEFAULT 0,
     hypotheses_confirmed INT NOT NULL DEFAULT 0,
@@ -39,7 +38,6 @@ CREATE TABLE IF NOT EXISTS memory.verification_sessions (
 );
 COMMENT ON TABLE memory.verification_sessions IS 'Сессии ручной верификации гипотез пользователем';
 COMMENT ON COLUMN memory.verification_sessions.id IS 'Уникальный идентификатор сессии';
-COMMENT ON COLUMN memory.verification_sessions.actor_id IS 'ID пользователя, с которым проводится верификация';
 COMMENT ON COLUMN memory.verification_sessions.status IS 'Статус сессии: active, completed, deferred';
 COMMENT ON COLUMN memory.verification_sessions.hypotheses_total IS 'Общее количество гипотез в сессии';
 COMMENT ON COLUMN memory.verification_sessions.proposal_task_id IS 'UUID задачи orchestrator_tasks, к которой привязана сессия (verification_proposal)';
@@ -50,7 +48,6 @@ CREATE TABLE IF NOT EXISTS memory.verification_actions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id UUID NOT NULL REFERENCES memory.verification_sessions(id) ON DELETE CASCADE,
     hypothesis_id UUID NOT NULL REFERENCES memory.hypotheses(id) ON DELETE CASCADE,
-    actor_id UUID NOT NULL REFERENCES users.actors(id),
     action_type memory.verification_action_type NOT NULL,
     original_text TEXT,
     updated_text TEXT,
@@ -100,15 +97,16 @@ BEGIN
             'Промпт для LLM-уточнения гипотезы на основе комментария пользователя',
             'internal'::public.prompt_type, v_destination_id,
             E'<Правила>\nТы — модуль уточнения гипотез интеллектуального агента.\n' ||
-            E'Тебе дана исходная гипотеза, извлечённая из диалога, и комментарий пользователя.\n' ||
-            E'Твоя задача — переформулировать гипотезу с учётом комментария.\n\n' ||
-            E'Правила:\n' ||
+            E'Тебе дана исходная гипотеза, извлечённая из диалога, контекст для понимания диалога и комментарий пользователя.\n' ||
+            E'Твоя задача — переформулировать гипотезу с учётом комментария пользователя.\n\n' ||
+            E'Задача:\n' ||
             E'1. Исправь фактические ошибки, на которые указал пользователь. Его исправления имеют наивысший приоритет.\n' ||
-            E'2. Добавь уточнения, если они есть.\n' ||
-            E'3. Удали ошибочные элементы без оговорок (не пиши "информации об X нет" — просто убери X).\n' ||
-            E'4. Не меняй суть гипотезы, если пользователь не просит.\n' ||
-            E'5. Итоговая гипотеза должна быть связной, непротиворечивой.\n' ||
-            E'6. Выведи только исправленный текст гипотезы.\n\n' ||
+            E'2. Исправь орфографию и пунктуацию если необходимо.\n' ||
+            E'3. Добавь уточнения, если они появились у пользователя.\n' ||
+            E'4. Ошибочные элементы на которые указал пользователь удалять без оговорок (не пиши "информации об X нет" — просто убери X).\n' ||
+            E'5. Не менть суть гипотезы, если пользователь не просит.\n' ||
+            E'6. Итоговая гипотеза должна быть связной, непротиворечивой.\n' ||
+            E'7. Выведи исправленный текст гипотезы.\n\n' ||
             E'<Исходная гипотеза>\n{{hypothesis_text}}\n\n' ||
             E'<Контекст (источник)>\n{{source_context}}\n\n' ||
             E'<Комментарий пользователя>\n{{user_comment}}\n\n' ||
@@ -122,12 +120,70 @@ BEGIN
              "top_k": 20,
              "min_p": 0.0,
              "max_tokens": 32768,
-             "presence_penalty": 1.5,
+             "presence_penalty": 0.0,
              "repetition_penalty": 1.0,
              "stop": ["<|im_end|>"],
              "chat_template_kwargs": {"enable_thinking": false}
             }'::jsonb,
             '{}'::jsonb, 'testing'::public.prompt_status, v_creator_id, '1.2.0', now()
+        );
+    END IF;
+END $$;
+
+
+-- Блок 6: Промпт для классификатора тем гипотез
+DO $$
+DECLARE
+    v_destination_id UUID;
+    v_creator_id UUID;
+    v_prompt_name TEXT := 'hypothesis_topic_classifier';
+    v_prompt_version TEXT := '1.1.0';
+BEGIN
+    SELECT id INTO v_destination_id FROM orchestrator.prompt_destinations WHERE name = 'internal_logic' LIMIT 1;
+    SELECT id INTO v_creator_id FROM users.actors WHERE type = 'owner' LIMIT 1;
+    
+    IF NOT EXISTS (SELECT 1 FROM orchestrator.prompts WHERE name = v_prompt_name AND version = v_prompt_version) THEN
+        INSERT INTO orchestrator.prompts (
+            version, name, description, type, destination_id, text, params,
+            prompt_effectiveness, status, created_by, agent_version, created_at
+        ) VALUES (
+            v_prompt_version, v_prompt_name,
+            'Классификатор гипотез по строгому справочнику тем. Возвращает JSON-маппинг ID гипотезы к ID темы.',
+            'internal'::public.prompt_type, v_destination_id,
+            E'<Правила>\n' ||
+            E'Ты — модуль классификации фактов (гипотез) базы знаний агента.\n' ||
+            E'Тебе дан список гипотез (с их ID, текстом, доменом и источником) и СТРОГИЙ справочник тем.\n\n' ||
+            E'Твоя задача:\n' ||
+            E'1. Выбрать для гипотез НАИБОЛЕЕ релевантные темы из справочника.\n' ||
+            E'2. Используй подсказки "Домен" и "Источник" — они помогают понять контекст гипотезы.\n' ||
+            E'3. Назначай тему только при полной смысловой уверенности. Если есть малейшее сомнение или тема подходит лишь частично — ставь null. Лучше пропустить тему, чем привязать неверно.\n' ||
+            E'4. ЗАПРЕЩЕНО выдумывать новые темы или изменять названия существующих. Используй ТОЧНЫЕ названия из справочника.\n' ||
+            E'5. Ответ должен быть СТРОГО в формате JSON-массива без markdown-обёртки.\n\n' ||
+            E'<Справочник тем>\n' ||
+            E'{topics_list}\n' ||
+            E'</Справочник тем>\n\n' ||
+            E'<Гипотезы для классификации>\n' ||
+            E'{hypotheses_list}\n' ||
+            E'</Гипотезы для классификации>\n\n' ||
+            E'<Формат ответа (строго JSON)>\n' ||
+            E'[\n' ||
+            E'  {"hypothesis_id": "uuid1...", "topic_name": "название темы"},\n' ||
+            E'  {"hypothesis_id": "uuid2...", "topic_name": null}\n' ||
+            E']\n' ||
+            E'</Формат ответа>\n</Правила>\n',
+            '{
+              "model_name": "Qwen3.5-9B-Q4_K_M.gguf",
+              "temperature": 0.8,
+              "top_p": 0.8,
+              "top_k": 20,
+              "min_p": 0.0,
+              "max_tokens": 32768,
+              "presence_penalty": 0.0,
+              "repetition_penalty": 1.0,
+              "stop": ["<|im_end|>"],
+              "chat_template_kwargs": {"enable_thinking": true}
+            }'::jsonb,
+            '{}'::jsonb, 'testing'::public.prompt_status, v_creator_id, '1.3.0', now()
         );
     END IF;
 END $$;

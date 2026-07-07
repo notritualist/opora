@@ -17,6 +17,7 @@ __description__ = "Utility module for updating statuses and saving metrics"
 
 import logging
 import psycopg2
+import json
 from psycopg2.extras import Json
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
@@ -169,58 +170,94 @@ def create_orchestrator_step(
     logger.debug("Step %s created for task %s (type: %s)", step_id[:8], task_id[:8], step_type_name)
     return step_id
 
-def complete_step_success(step_id: str, output_data: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Завершает шаг успешно (status='completed').
-    
-    Args:
-        step_id (str): UUID шага
-        output_data (dict, optional): Результаты выполнения шага
-    """
-    db_config: dict = load_postgres_config()
-    with psycopg2.connect(**db_config) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE orchestrator.orchestrator_steps
-                SET 
-                    status = 'completed'::task_status,
-                    completed_at = NOW(),
-                    output_data = %s,
-                    latency = EXTRACT(EPOCH FROM (NOW() - created_at))
-                WHERE id = %s
-            """, (Json(output_data) if output_data else None, step_id))
-            conn.commit()
-    logger.debug("Step %s completed successfully", step_id[:8])
+def complete_step_success(
+    step_id: str,
+    output_data: Optional[Dict[str, Any]] = None,
+    llm_metric_id: Optional[str] = None,
+    emb_metric_id: Optional[str] = None
+) -> None:
+    """Завершает шаг оркестратора со статусом 'completed'."""
+    db_config = load_postgres_config()
+    try:
+        with psycopg2.connect(**db_config) as conn:
+            with conn.cursor() as cur:
+                # Базовый UPDATE
+                cur.execute("""
+                    UPDATE orchestrator.orchestrator_steps
+                    SET status = 'completed'::task_status,
+                        output_data = %s::jsonb,
+                        completed_at = NOW(),
+                        latency = EXTRACT(EPOCH FROM (NOW() - created_at))
+                    WHERE id = %s
+                """, (json.dumps(output_data or {}), step_id))
+                
+                # === НОВОЕ: Обновляем метрики, если переданы ===
+                if llm_metric_id or emb_metric_id:
+                    update_fields = []
+                    params = []
+                    if llm_metric_id:
+                        update_fields.append("llm_metric_id = %s::uuid")
+                        params.append(llm_metric_id)
+                    if emb_metric_id:
+                        update_fields.append("emb_metric_id = %s::uuid")
+                        params.append(emb_metric_id)
+                    params.append(step_id)
+                    cur.execute(f"""
+                        UPDATE orchestrator.orchestrator_steps
+                        SET {', '.join(update_fields)}
+                        WHERE id = %s
+                    """, params)
+                
+                conn.commit()
+        logger.debug("Step %s completed successfully", step_id[:8])
+    except Exception as e:
+        logger.error("Failed to complete step %s: %s", step_id[:8], e, exc_info=True)
+
 
 def complete_step_error(
     step_id: str,
     error_module: str,
-    error_message: str
+    error_message: str,
+    llm_metric_id: Optional[str] = None,
+    emb_metric_id: Optional[str] = None
 ) -> None:
-    """
-    Завершает шаг с ошибкой (status='failed').
-    
-    Args:
-        step_id (str): UUID шага
-        error_module (str): Имя модуля, где произошла ошибка
-        error_message (str): Текст ошибки
-    """
-    db_config: dict = load_postgres_config()
-    with psycopg2.connect(**db_config) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE orchestrator.orchestrator_steps
-                SET 
-                    status = 'failed'::task_status,
-                    completed_at = NOW(),
-                    error_module = %s,
-                    error_message = %s,
-                    error_timestamp = NOW(),
-                    latency = EXTRACT(EPOCH FROM (NOW() - created_at))
-                WHERE id = %s
-            """, (error_module, error_message, step_id))
-            conn.commit()
-    logger.warning("Step %s completed with error: %s", step_id[:8], error_message)
+    """Завершает шаг оркестратора со статусом 'failed'."""
+    db_config = load_postgres_config()
+    try:
+        with psycopg2.connect(**db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE orchestrator.orchestrator_steps
+                    SET status = 'failed'::task_status,
+                        error_module = %s,
+                        error_message = %s,
+                        error_timestamp = NOW(),
+                        completed_at = NOW(),
+                        latency = EXTRACT(EPOCH FROM (NOW() - created_at))
+                    WHERE id = %s
+                """, (error_module, error_message, step_id))
+                
+                # === НОВОЕ: Обновляем метрики, если переданы ===
+                if llm_metric_id or emb_metric_id:
+                    update_fields = []
+                    params = []
+                    if llm_metric_id:
+                        update_fields.append("llm_metric_id = %s::uuid")
+                        params.append(llm_metric_id)
+                    if emb_metric_id:
+                        update_fields.append("emb_metric_id = %s::uuid")
+                        params.append(emb_metric_id)
+                    params.append(step_id)
+                    cur.execute(f"""
+                        UPDATE orchestrator.orchestrator_steps
+                        SET {', '.join(update_fields)}
+                        WHERE id = %s
+                    """, params)
+                
+                conn.commit()
+        logger.debug("Step %s marked as failed", step_id[:8])
+    except Exception as e:
+        logger.error("Failed to complete step error %s: %s", step_id[:8], e, exc_info=True)
 
 # =============================================================================
 # === СОХРАНЕНИЕ МЕТРИК И РАССУЖДЕНИЙ ===
@@ -337,7 +374,7 @@ def save_llm_metrics(
 def save_reasoning(
     orchestrator_step_id: str,
     content: str,
-    content_type: str # 'messages', 'reflection', 'second_reflection'
+    content_type: str
 ) -> Optional[str]:
     """
     Сохраняет рассуждение (Chain of Thought) в orchestrator.reasonings.
@@ -379,6 +416,7 @@ def save_reasoning(
     logger.debug("Reasoning saved: %s (step: %s)", reasoning_id[:8], orchestrator_step_id[:8])
     return reasoning_id
 
+
 def set_step_llm_metric_id(step_id: str, llm_metric_id: str) -> None:
     """
     Привязывает запись метрики LLM к шагу оркестратора.
@@ -398,6 +436,7 @@ def set_step_llm_metric_id(step_id: str, llm_metric_id: str) -> None:
             conn.commit()
     logger.debug("Linked llm_metric_id %s to step %s", llm_metric_id[:8], step_id[:8])
 
+
 def set_step_reasoning_id(step_id: str, reasoning_id: str) -> None:
     """
     Привязывает запись рассуждения к шагу оркестратора.
@@ -416,6 +455,7 @@ def set_step_reasoning_id(step_id: str, reasoning_id: str) -> None:
     # поэтому обратная ссылка не требуется. Функция оставлена для будущего расширения.
     logger.debug("Reasoning %s already linked to step %s via FK", reasoning_id[:8], step_id[:8])
     pass
+
 
 def save_llm_artifacts(
     llm_metric_id: str,
@@ -454,3 +494,125 @@ def save_llm_artifacts(
             conn.commit()
     logger.debug(f"LLM artifacts saved: {artifact_id[:8]} (metric: {llm_metric_id[:8]})")
     return artifact_id
+
+
+def save_emb_metrics(
+    orchestrator_step_id: str,
+    host: str,
+    model: str,
+    param: Dict[str, Any],
+    vector_dimension: int,
+    prompt_tokens: int,
+    out_time: Optional[datetime],
+    in_time: Optional[datetime],
+    full_time: float,
+    error_status: bool,
+    error_message: Optional[str] = None
+) -> str:
+    """
+    Сохраняет метрики эмбеддинга в metrics.emb_internal.
+    
+    Args:
+        orchestrator_step_id: UUID шага оркестратора
+        host: Хост и порт emb-srv (например, "192.168.100.3:8000")
+        model: Название модели эмбеддингов
+        param: Параметры векторизации (JSONB)
+        vector_dimension: Размерность полученного вектора
+        prompt_tokens: Количество токенов в тексте
+        out_time: Время отправки запроса
+        in_time: Время получения ответа
+        full_time: Общее время генерации (сек)
+        error_status: Флаг ошибки
+        error_message: Текст ошибки (если была)
+        
+    Returns:
+        str: UUID записи метрики
+    """
+    db_config: dict = load_postgres_config()
+    
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO metrics.emb_internal (
+                    orchestrator_step_id, host, model, param,
+                    vector_dimension, prompt_tokens,
+                    out_time, in_time, full_time,
+                    error_status, error_message, error_time,
+                    agent_version, timestamp
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                )
+                RETURNING id
+            """, (
+                orchestrator_step_id, host, model, Json(param),
+                vector_dimension, prompt_tokens,
+                out_time, in_time, full_time,
+                error_status, error_message,
+                datetime.now(timezone.utc) if error_status else None,
+                agent_version
+            ))
+            metric_id = str(cur.fetchone()[0])
+            conn.commit()
+            
+    logger.debug("Emb metrics saved: %s (step: %s)", metric_id[:8], orchestrator_step_id[:8])
+    return metric_id
+
+
+def close_dangling_orchestrator_records(db_config: dict) -> tuple:
+    """
+    Закрывает зависшие задачи и шаги оркестратора при перезапуске системы.
+    Вызывается из main.py при старте агента.
+    Аналог close_dangling_sessions() и close_dangling_verification_sessions().
+    
+    Args:
+        db_config: параметры подключения к PostgreSQL
+        
+    Returns:
+        tuple: (tasks_closed: int, steps_closed: int)
+    """
+    tasks_closed = 0
+    steps_closed = 0
+    try:
+        with psycopg2.connect(**db_config) as conn:
+            with conn.cursor() as cur:
+                # Закрываем зависшие задачи (pending/running → failed)
+                cur.execute("""
+                    UPDATE orchestrator.orchestrator_tasks
+                    SET status = 'failed'::task_status,
+                        completed_at = NOW(),
+                        error_module = 'main_startup',
+                        error_message = 'System restart: task interrupted',
+                        error_timestamp = NOW(),
+                        run_latency = EXTRACT(EPOCH FROM (NOW() - started_at)),
+                        total_latency = EXTRACT(EPOCH FROM (NOW() - created_at))
+                    WHERE status IN ('pending'::task_status, 'running'::task_status)
+                """)
+                tasks_closed = cur.rowcount
+                
+                # Закрываем зависшие шаги (pending/running → failed)
+                cur.execute("""
+                    UPDATE orchestrator.orchestrator_steps
+                    SET status = 'failed'::task_status,
+                        completed_at = NOW(),
+                        error_module = 'main_startup',
+                        error_message = 'System restart: step interrupted',
+                        error_timestamp = NOW(),
+                        latency = EXTRACT(EPOCH FROM (NOW() - created_at))
+                    WHERE status IN ('pending'::task_status, 'running'::task_status)
+                """)
+                steps_closed = cur.rowcount
+                
+                conn.commit()
+                
+                if tasks_closed > 0 or steps_closed > 0:
+                    logger.warning(
+                        "Closed dangling orchestrator records on startup: "
+                        "%d task(s), %d step(s)",
+                        tasks_closed, steps_closed
+                    )
+                return (tasks_closed, steps_closed)
+    except Exception as e:
+        logger.error(
+            "Error closing dangling orchestrator records: %s", e, exc_info=True
+        )
+        return (0, 0)

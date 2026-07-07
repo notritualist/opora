@@ -33,51 +33,26 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # === ПОЛУЧЕНИЕ DRAFT-ГИПОТЕЗ ================================================
 # =============================================================================
-def get_draft_hypotheses(
-    db_config: dict,
-    actor_id: Optional[str] = None,
-    limit: int = 50,
-    offset: int = 0
-) -> List[Dict[str, Any]]:
-    """
-    Возвращает гипотезы со статусом 'draft', отсортированные по дате создания.
-    """
+def get_unverified_hypotheses(db_config: dict, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+    """Возвращает гипотезы со статусом 'needs_clarification', готовые к верификации."""
     conn = psycopg2.connect(**db_config)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            query = """
-                SELECT
-                    h.id,
-                    h.actor_id,
-                    h.hypothesis_text,
-                    h.source_message_ids,
-                    h.domain_code,
-                    h.knowledge_source,
-                    h.entity,
-                    h.relation,
-                    h.confidence,
-                    h.status,
-                    h.created_at
+            cur.execute("""
+                SELECT h.id, h.hypothesis_text, h.source_message_ids, h.domain_code,
+                       h.topic_id, t.name AS topic_name, h.knowledge_source, 
+                       h.confidence, h.status, h.created_at,
+                       h.dialogue_id  -- НОВОЕ
                 FROM memory.hypotheses h
-                WHERE h.status = 'draft'::memory.hypothesis_status
-            """
-            params: list = []
-
-            if actor_id:
-                query += " AND h.actor_id = %s::uuid"
-                params.append(actor_id)
-
-            query += """
+                LEFT JOIN memory.topics t ON t.id = h.topic_id
+                WHERE h.status = 'needs_clarification'::memory.hypothesis_status
                 ORDER BY h.confidence DESC, h.created_at ASC
                 LIMIT %s OFFSET %s
-            """
-            params.extend([limit, offset])
-
-            cur.execute(query, params)
-            rows = cur.fetchall()
-            return [dict(r) for r in rows]
+            """, (limit, offset))
+            return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
+
 
 def get_draft_count(db_config: dict, actor_id: Optional[str] = None) -> int:
     """Возвращает количество draft-гипотез."""
@@ -86,16 +61,13 @@ def get_draft_count(db_config: dict, actor_id: Optional[str] = None) -> int:
         with conn.cursor() as cur:
             query = """
                 SELECT COUNT(*) FROM memory.hypotheses
-                WHERE status = 'draft'::memory.hypothesis_status
+                WHERE status = 'needs_clarification'::memory.hypothesis_status
             """
-            params: list = []
-            if actor_id:
-                query += " AND actor_id = %s::uuid"
-                params.append(actor_id)
-            cur.execute(query, params)
+            cur.execute(query)
             return cur.fetchone()[0]
     finally:
         conn.close()
+
 
 # =============================================================================
 # === КОНТЕКСТ ИСТОЧНИКОВ ====================================================
@@ -194,7 +166,6 @@ def get_source_context(
 # =============================================================================
 def create_session(
     db_config: dict, 
-    actor_id: str, 
     total: int,
     proposal_task_id: Optional[str] = None,
     hypothesis_ids: Optional[List[str]] = None
@@ -214,9 +185,8 @@ def create_session(
             hypothesis_array = hypothesis_ids if hypothesis_ids else []
             cur.execute("""
                 INSERT INTO memory.verification_sessions 
-                (actor_id, status, hypotheses_total, proposal_task_id, hypothesis_ids, started_at) 
+                (status, hypotheses_total, proposal_task_id, hypothesis_ids, started_at) 
                 VALUES (
-                    %s::uuid, 
                     'active'::memory.verification_session_status, 
                     %s,
                     %s::uuid,
@@ -224,7 +194,7 @@ def create_session(
                     now()
                 ) 
                 RETURNING id
-            """, (actor_id, total, proposal_task_id, hypothesis_array))
+            """, (total, proposal_task_id, hypothesis_array))
             session_id = str(cur.fetchone()[0])
             conn.commit()
             logger.info(
@@ -236,6 +206,7 @@ def create_session(
             return session_id
     finally:
         conn.close()
+
 
 def complete_session(db_config: dict, session_id: str) -> None:
     """Завершает сессию верификации."""
@@ -252,6 +223,7 @@ def complete_session(db_config: dict, session_id: str) -> None:
             logger.info("Verification session completed: %s", session_id[:8])
     finally:
         conn.close()
+
 
 def defer_session(db_config: dict, session_id: str, defer_minutes: float) -> None:
     """Откладывает сессию на N минут."""
@@ -271,6 +243,7 @@ def defer_session(db_config: dict, session_id: str, defer_minutes: float) -> Non
     finally:
         conn.close()
 
+
 def can_propose_verification(db_config: dict) -> bool:
     """
     Проверяет, можно ли предложить верификацию.
@@ -289,6 +262,7 @@ def can_propose_verification(db_config: dict) -> bool:
     except Exception as e:
         logger.warning(f"Error checking can_propose_verification: {e}")
         return True  # В случае ошибки разрешаем предложение
+
 
 def get_defer_minutes(db_config: dict) -> float:
     """Получает настройку verification_defer_minutes."""
@@ -311,7 +285,6 @@ def record_action(
     db_config: dict,
     session_id: str,
     hypothesis_id: str,
-    actor_id: str,
     action_type: str,  # confirmed | rejected | edited | skipped
     original_text: Optional[str] = None,
     updated_text: Optional[str] = None,
@@ -338,17 +311,17 @@ def record_action(
             # 1. Вставляем действие
             cur.execute("""
                 INSERT INTO memory.verification_actions (
-                    session_id, hypothesis_id, actor_id, action_type,
+                    session_id, hypothesis_id, action_type,
                     original_text, updated_text, user_comment,
                     orchestrator_step_id, prompt_id
                 ) VALUES (
-                    %s::uuid, %s::uuid, %s::uuid,
+                    %s::uuid, %s::uuid,
                     %s::memory.verification_action_type,
                     %s, %s, %s, %s::uuid, %s::uuid
                 )
                 RETURNING id
             """, (
-                session_id, hypothesis_id, actor_id, action_type,
+                session_id, hypothesis_id, action_type,
                 original_text, updated_text, user_comment,
                 orchestrator_step_id, prompt_id,
             ))
@@ -365,7 +338,7 @@ def record_action(
                             verified_at = NOW(),
                             verified_by_actor_id = %s::uuid
                         WHERE id = %s::uuid
-                    """, (new_hypothesis_status, updated_text, actor_id, hypothesis_id))
+                    """, (new_hypothesis_status, updated_text, hypothesis_id))
                 else:
                     cur.execute("""
                         UPDATE memory.hypotheses
@@ -374,7 +347,7 @@ def record_action(
                             verified_at = NOW(),
                             verified_by_actor_id = %s::uuid
                         WHERE id = %s::uuid
-                    """, (new_hypothesis_status, actor_id, hypothesis_id))
+                    """, (new_hypothesis_status, hypothesis_id))
 
             # 3. Обновляем счётчики сессии
             counter_column = f"hypotheses_{action_type}" if action_type != 'confirmed' else "hypotheses_confirmed"
@@ -397,6 +370,7 @@ def record_action(
         raise
     finally:
         conn.close()
+
 
 def complete_verification_proposal_task(
     db_config: dict, 
@@ -457,6 +431,7 @@ def complete_verification_proposal_task(
             "Failed to complete verification proposal task %s: %s",
             task_id[:8] if task_id else "None", e, exc_info=True
         )
+
 
 def close_dangling_verification_sessions(db_config: dict) -> int:
     """

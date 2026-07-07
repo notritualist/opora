@@ -10,6 +10,7 @@ main-srv/src/orchestrator/orchestrator_entry.py
 - memory_extraction: извлечение гипотез из закрытых диалогов в долговременную память.
 - verification_proposal: проверка наличия draft-гипотез и отправка NOTIFY в UI.
 - hypothesis_refinement: LLM-уточнение гипотезы по комментарию пользователя.
+- schedule_graph_update: обновление графа знаний из подтверждённой гипотезы.
 
 Архитектура:
 - Универсальная функция create_orchestrator_task() с валидацией task_type.
@@ -20,7 +21,7 @@ main-srv/src/orchestrator/orchestrator_entry.py
 - Агент-версия передаётся глобально через version.py.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __description__ = "Entry point for orchestrator"
 
 import logging
@@ -29,10 +30,10 @@ from typing import Optional, Dict, Any
 from psycopg2.extras import RealDictCursor, Json
 from services.lifecycle_manager  import LifecycleManager
 from db_manager.db_manager import load_postgres_config
-# Глобальная версия проекта (из pyproject.toml через version.py)
 from version import __version__ as agent_version
 
 logger = logging.getLogger(__name__)
+
 
 def on_user_message(message_id: str) -> str:
     """
@@ -127,8 +128,8 @@ def on_user_message(message_id: str) -> str:
         if conn:
             conn.close()
 
+
 def schedule_memory_extraction(
-    actor_id: Optional[str] = None,
     message_ids: Optional[list] = None,
     priority: float = 0.3
 ) -> str:
@@ -142,7 +143,6 @@ def schedule_memory_extraction(
     3. Возврат UUID созданной задачи.
     
     Args:
-        actor_id: если указан — анализировать только этого пользователя
         message_ids: если указан — конкретные сообщения (иначе автовыборка из БД)
         priority: приоритет задачи (по умолчанию 0.3 — ниже ответа пользователю)
         
@@ -153,8 +153,6 @@ def schedule_memory_extraction(
         RuntimeError: если тип задачи не найден или ошибка БД
     """
     input_data: Dict[str, Any] = {"mode": "auto"}
-    if actor_id:
-        input_data["actor_id"] = actor_id
     if message_ids:
         input_data["message_ids"] = message_ids
         input_data["mode"] = "explicit"
@@ -165,6 +163,7 @@ def schedule_memory_extraction(
         priority=priority
     )
 
+
 def schedule_verification_proposal(priority: float = 0.2) -> str:
     """Создаёт задачу проверки необходимости верификации."""
     return create_orchestrator_task(
@@ -172,6 +171,22 @@ def schedule_verification_proposal(priority: float = 0.2) -> str:
         input_data={"mode": "auto"},
         priority=priority
     )
+
+
+# Константа приоритета для обновления графа памяти
+GRAPH_UPDATE_PRIORITY = 0.2
+
+def schedule_graph_update(
+    hypothesis_id: str,
+    priority: float = GRAPH_UPDATE_PRIORITY,
+) -> str:
+    """Создаёт задачу обновления графа знаний из подтверждённой гипотезы."""
+    return create_orchestrator_task(
+        task_type_name="graph_update",
+        input_data={"hypothesis_id": hypothesis_id},
+        priority=priority,
+    )
+
 
 def create_orchestrator_task(
     task_type_name: str,
@@ -245,22 +260,47 @@ def create_orchestrator_task(
         logger.error(f"Database error creating orchestrator task: {e}", exc_info=True)
         raise RuntimeError(f"Failed to create orchestrator task: {e}") from e
 
-# Константа приоритета для очереди оркестратора
+
+# Константа приоритета для уточнения гипотез
 HYPOTHESIS_REFINEMENT_PRIORITY = 0.6
 
 def schedule_hypothesis_refinement(
     hypothesis_id: str,
     user_comment: str,
-    verification_session_id: str,
-    priority: float = HYPOTHESIS_REFINEMENT_PRIORITY,
+    verification_session_id: Optional[str] = None,
+    metadata_updates: Optional[dict] = None,
+    priority: float = 0.5
 ) -> str:
     """Создаёт задачу LLM-уточнения гипотезы."""
     return create_orchestrator_task(
         task_type_name="hypothesis_refinement",
-        input_data={
+        input_data = {
             "hypothesis_id": hypothesis_id,
             "user_comment": user_comment,
             "verification_session_id": verification_session_id,
+            "metadata_updates": metadata_updates or {},
         },
         priority=priority,
     )
+
+
+def schedule_topic_classification(priority: float = 0.4) -> str:
+    """Планирует задачу классификации гипотез по темам."""
+    from db_manager.db_manager import load_postgres_config
+    db_config = load_postgres_config()
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id FROM orchestrator.task_types WHERE type_name = 'topic_classification'
+            """)
+            row = cur.fetchone()
+            if not row: raise RuntimeError("task_type 'topic_classification' not found")
+            task_type_id = row[0]
+            
+            cur.execute("""
+                INSERT INTO orchestrator.orchestrator_tasks (task_type_id, input_data, priority, status, agent_version)
+                VALUES (%s, %s, %s, 'pending', %s) RETURNING id
+            """, (task_type_id, '{"limit": 200}', priority, agent_version))
+            task_id = str(cur.fetchone()[0])
+            conn.commit()
+            return task_id

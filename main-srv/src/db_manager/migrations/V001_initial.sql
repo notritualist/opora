@@ -222,8 +222,7 @@ DO $$ BEGIN
             'draft',                 -- Только что извлечена
             'needs_clarification',   -- Нужно уточнить
             'confirmed',             -- Подтверждена
-            'refuted',               -- Опровергнута
-            'merged'                 -- Объединена с другой гипотезой
+            'refuted'                -- Опровергнута      
         );
     END IF;
 END $$;
@@ -241,18 +240,6 @@ DO $$ BEGIN
 END $$;
 COMMENT ON TYPE memory.knowledge_source IS 'Источник извлечённого знания';
 
--- Создание ENUM для Тип отношения к сущности гипотез
-DO $$ BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'memory.knowledge_relation') THEN
-        CREATE TYPE memory.knowledge_relation AS ENUM (
-            'property',        -- Свойство, характеристика, атрибут
-            'recommendation',  -- Совет, предложение, рекомендация
-            'preference',      -- Личное предпочтение, привычка
-            'constraint'       -- Ограничение, препятствие, проблема
-        );
-    END IF;
-END $$;
-COMMENT ON TYPE memory.knowledge_relation IS 'Тип отношения факта к сущности';
 
 -- Блок 3: Общие функции
 -- Общая функция для обновления полей updated_at
@@ -495,7 +482,8 @@ VALUES
     ('user_answer_vectorize',       'Векторизация ответа пользователю'),
     ('reasoning_vectorize',         'Векторизация цепочки рассуждений (reasoning / COT)'),
     ('prompts_vectorize', 'Векторизация промптов'),
-    ('memory_extraction', 'Извлечение гипотез из закрытых диалогов')
+    ('memory_extraction', 'Извлечение гипотез из закрытых диалогов'),
+    ('topic_classification', 'LLM-классификация draft-гипотез по справочнику memory.topics')
 ON CONFLICT (type_name) DO NOTHING;
 
 
@@ -531,7 +519,8 @@ VALUES
     ('user_answer_vectorize',       'Векторизация ответа пользователю', '1.1.0'),
     ('reasoning_vectorize',         'Векторизация цепочки рассуждений (reasoning / COT)', '1.1.0'),
     ('prompts_vectorize',           'Векторизация промпта', '1.1.0'),
-    ('memory_extraction', 'Извлечение гипотез из закрытых диалогов', '1.2.0')
+    ('memory_extraction', 'Извлечение гипотез из закрытых диалогов', '1.1.0'),
+    ('topic_classification', 'Батчевая классификация гипотез и присвоение topic_id', '1.1.0')
 ON CONFLICT (step_name) DO NOTHING;
 
 
@@ -948,19 +937,19 @@ BEGIN
             E'Никогда не выдумывай факты, цифры, ссылки ради связности текста. Если не хватает данных для полноценного точного ответа - запроси у собеседника.\n' ||
             E'Для списков используй маркированные перечисления без эмодзи и смайликов.\n' ||
             E'Если вопрос подразумевает план действий — перечисляй конкретные шаги.\n' ||
-            E'Отвечай от женского лица, использую женские грамматические формы (я, моя, сказала и т.п.).\n' ||
+            E'Отвечай от женского лица, использую женские грамматические формы (я, сказала и т.п.).\n' ||
             E'</Правила>\n',
             '{
                 "model_name": "Qwen3.5-9B-Q4_K_M.gguf",
                 "temperature": 0.9,
-                "top_p": 1.0,
-                "top_k": 40,
+                "top_p": 0.95,
+                "top_k": 20,
                 "min_p": 0,
                 "max_tokens": 32768,
-                "presence_penalty": 2.0,
+                "presence_penalty": 1.0,
                 "repetition_penalty": 1.0,
                 "stop": ["<|im_end|>"],
-                "chat_template_kwargs": {"enable_thinking": false}
+                "chat_template_kwargs": {"enable_thinking": true}
             }'::jsonb,
             '{}'::jsonb,
             'testing'::public.prompt_status,
@@ -989,40 +978,32 @@ INSERT INTO orchestrator.prompts (
     E'ИЗВЛЕКАТЬ:\n' ||
     E'- Конкретные факты, планы, предпочтения, личные данные, события, ограничения, навыки, привычки.\n' ||
     E'- Внешний контекст: новости, статистику, мировые события, законы, экономические данные, полезные знания.\n' ||
-    E'- Суть рекомендаций и советов, которые даёт в том числе ассистент (не переписывай дословно пустые фразы, выдели суть).\n\n' ||
+    E'- Суть рекомендаций и советов, которые даёт в том числе ассистент (не переписывай дословно пустые фразы, выдели конкретную суть).\n\n' ||
     E'НЕ ИЗВЛЕКАТЬ: приветствия, прощания, общие фразы без смысла, риторику, неинформативные реплики и тому подобное.\n' ||
     E'Если в чанке сообщений значимых знаний нет — верни []\n\n' ||
     E'УКАЖИ ИСТОЧНИК ЗНАНИЯ (knowledge_source):\n' ||
     E'- "user" — факт сообщил пользователь.\n' ||
     E'- "agent" — факт предложен ассистентом (совет, рекомендация, предположение).\n' ||
-    E'- "external" — внешний контекст, упомянутый любым участником (новость, статистика, закон).\n' ||
+    E'- "external" — внешний контекст, упомянутый любым участником (новость, статистика, закон, знание).\n\n' ||
     E'КЛАССИФИЦИРУЙ извлечённое ПО ДОМЕНАМ (domain_code): {domains}\n' ||
-    E'Если факт не подходит ни под один домен, ставь "general".\n\n' ||
+    E'Если извлеченное не подходит по смыслу ни к одному домену, укажи "general".\n' ||
+    E'source_message_ids ДОЛЖНЫ ТОЧНО ССЫЛАТЬСЯ НА ИСТОЧНИК hypothesis_text.\n\n' ||
     E'ОЦЕНИ УВЕРЕННОСТЬ (confidence) от 0.0 до 1.0:\n' ||
     E'0.85–1.0 — прямо сказано в тексте.\n' ||
     E'0.60–0.84 — однозначно следует из контекста.\n' ||
     E'0.30–0.59 — слабая догадка.\n' ||
     E'<0.3 — не включай.\n\n' ||
-    E'ДОПОЛНИ КАЖДЫЙ ФАКТ ПОЛЯМИ ДЛЯ СВЯЗНОСТИ (entity и relation):\n' ||
-    E'- "entity": короткий идентификатор (slug на латинице) главной сущности, к которой относится этот факт. Например, "user_car", "village_trips". Если в этом же диалоге ранее уже встречалась та же сущность, ОБЯЗАТЕЛЬНО используй тот же идентификатор. Если сущность новая, придумай осмысленный уникальный slug. Если не можешь определить, ставь null.\n' ||
-    E'- "relation": тип отношения этого факта к сущности. Ровно одно из:\n' ||
-    E'"property" — свойство, характеристика, атрибут сущности.\n' ||
-    E'"recommendation" — совет, предложение, рекомендация (обычно от агента).\n' ||
-    E'"preference" — личное предпочтение, привычка, правило пользователя.\n' ||
-    E'"constraint" — ограничение, препятствие, проблема, которую нельзя игнорировать.\n\n' ||
     E'ФОРМАТ ОТВЕТА — строго JSON-массив без markdown-обёртки:\n' ||
     E'[\n' ||
     E'  {\n' ||
     E'    "hypothesis_text": "текст факта",\n' ||
     E'    "domain_code": "...",\n' ||
     E'    "confidence": 0.9,\n' ||
-    E'    "source_message_ids": ["uuid1"],\n' ||
-    E'    "knowledge_source": "user",\n' ||
-    E'    "entity": "...",\n' ||
-    E'    "relation": "property"\n' ||
+    E'    "source_message_ids": ["uuid или несколько uuid"],\n' ||
+    E'    "knowledge_source": "user"\n' ||
     E'  }\n' ||
     E']\n\n' ||
-    E'ПРИМЕРЫ:\n\n' ||
+    E'ПРИМЕРЫ:\n' ||
     E'1. Навык пользователя (агрегация):\n' ||
     E'Пользователь: ''Пишу на Python, последние 2 года плотно занимаюсь NLP.''\n' ||
     E'Ассистент: ''Какие библиотеки используешь?''\n' ||
@@ -1033,10 +1014,8 @@ INSERT INTO orchestrator.prompts (
     E'    "hypothesis_text": "Пользователь владеет Python, специализируется на NLP (опыт 2 года), использует библиотеки Transformers, torch, spaCy",\n' ||
     E'    "domain_code": "skills",\n' ||
     E'    "confidence": 0.95,\n' ||
-    E'    "source_message_ids": ["msg2", "msg3", "msg4"],\n' ||
-    E'    "knowledge_source": "user",\n' ||
-    E'    "entity": "python_nlp_skill",\n' ||
-    E'    "relation": "property"\n' ||
+    E'    "source_message_ids": ["uuid..., "uuid...", "uuid..."],\n' ||
+    E'    "knowledge_source": "user"\n' ||
     E'  }\n' ||
     E']\n\n' ||
     E'2. Внешний контекст от пользователя:\n' ||
@@ -1047,19 +1026,15 @@ INSERT INTO orchestrator.prompts (
     E'    "hypothesis_text": "В России острый дефицит бензина и дизеля, производство покрывает около 80% спроса",\n' ||
     E'    "domain_code": "general",\n' ||
     E'    "confidence": 1.0,\n' ||
-    E'    "source_message_ids": ["msg5"],\n' ||
-    E'    "knowledge_source": "external",\n' ||
-    E'    "entity": "russia_fuel_crisis",\n' ||
-    E'    "relation": "property"\n' ||
+    E'    "source_message_ids": ["uuid..."],\n' ||
+    E'    "knowledge_source": "external"\n' ||
     E'  },\n' ||
     E'  {\n' ||
     E'    "hypothesis_text": "Правительство разрешило продажу топлива класса Евро-3 вместо Евро-5",\n' ||
     E'    "domain_code": "general",\n' ||
     E'    "confidence": 1.0,\n' ||
-    E'    "source_message_ids": ["msg5"],\n' ||
-    E'    "knowledge_source": "external",\n' ||
-    E'    "entity": "fuel_standard_change",\n' ||
-    E'    "relation": "property"\n' ||
+    E'    "source_message_ids": ["uuid..."],\n' ||
+    E'    "knowledge_source": "external"\n' ||
     E'  }\n' ||
     E']\n\n' ||
     E'3. Рекомендация ассистента:\n' ||
@@ -1067,49 +1042,36 @@ INSERT INTO orchestrator.prompts (
     E'→\n' ||
     E'[\n' ||
     E'  {\n' ||
-    E'    "hypothesis_text": "Если нужно сэкономить топливо, следует отключать кондиционер",\n' ||
-    E'    "domain_code": "tasks",\n' ||
+    E'    "hypothesis_text": "Если нужно сэкономить топливо в автомобиле, следует отключать кондиционер",\n' ||
+    E'    "domain_code": "skills",\n' ||
     E'    "confidence": 0.7,\n' ||
-    E'    "source_message_ids": ["msg6"],\n' ||
-    E'    "knowledge_source": "agent",\n' ||
-    E'    "entity": "fuel_saving_tips",\n' ||
-    E'    "relation": "recommendation"\n' ||
+    E'    "source_message_ids": ["uuid..."],\n' ||
+    E'    "knowledge_source": "agent"\n' ||
     E'  }\n' ||
     E']\n\n' ||
     E'4. Личное предпочтение и ограничение пользователя:\n' ||
-    E'Пользователь: ''Я принципиально не езжу на автобусах. Магазины только в 10 км от деревни, пешком не дойти.''\n' ||
+    E'Пользователь: ''Я не езжу на автобусах потому что они ходят раз в день. Магазины только в 10 км от деревни, пешком не дойти.''\n' ||
     E'→\n' ||
     E'[\n' ||
     E'  {\n' ||
-    E'    "hypothesis_text": "Пользователь не пользуется общественным транспортом (автобусами)",\n' ||
-    E'    "domain_code": "preferences",\n' ||
+    E'    "hypothesis_text": "Пользователь не пользуется общественным транспортом (автобусами) по причине того что в его деревне они ходят раз в сутки.",\n' ||
+    E'    "domain_code": "user_profile",\n' ||
     E'    "confidence": 1.0,\n' ||
-    E'    "source_message_ids": ["msg7"],\n' ||
-    E'    "knowledge_source": "user",\n' ||
-    E'    "entity": "transport_preferences",\n' ||
-    E'    "relation": "preference"\n' ||
-    E'  },\n' ||
-    E'  {\n' ||
-    E'    "hypothesis_text": "Ближайшие магазины находятся в 10 км от деревни, пешком недоступны (ограничение для пользователя)",\n' ||
-    E'    "domain_code": "tasks",\n' ||
-    E'    "confidence": 1.0,\n' ||
-    E'    "source_message_ids": ["msg8"],\n' ||
-    E'    "knowledge_source": "user",\n' ||
-    E'    "entity": "village_shopping",\n' ||
-    E'    "relation": "constraint"\n' ||
+    E'    "source_message_ids": ["uuid..."],\n' ||
+    E'    "knowledge_source": "user"\n' ||
     E'  }\n' ||
     E']',
     '{
         "model_name": "Qwen3.5-9B-Q4_K_M.gguf",
-        "temperature": 0.7,
+        "temperature": 0.8,
         "top_p": 0.8,
         "top_k": 20,
         "min_p": 0.0,
-        "max_tokens": 32768,
-        "presence_penalty": 1.5,
+        "max_tokens": 65536,
+        "presence_penalty": 0.0,
         "repetition_penalty": 1.0,
         "stop": ["<|im_end|>"],
-        "chat_template_kwargs": {"enable_thinking": false}
+        "chat_template_kwargs": {"enable_thinking": true}
     }'::jsonb,
     '{}'::jsonb,
     'testing'::public.prompt_status,
@@ -1465,42 +1427,57 @@ INSERT INTO memory.knowledge_domains (code, name, description, agent_version) VA
     ('health', 'Здоровье', 'Медицина, заболевания, лекарства, спорт, профилактика здоровья',           '1.2.0'),
     ('people', 'Люди и связи', 'Люди, социальные связи, контакты, уровень доверия, группы, отношения', '1.2.0'),
     ('work', 'Работа и карьера', 'Проекты, обязанности, карьера, бизнес, заработок',                   '1.2.0'),
-    ('skills',      'Навыки',                'Умения, процедуры, инструкции, опыт в чем-либо',         '1.2.0'),
-    ('food', 'Продукты и питание', 'Продукты, рецепты, рацион, калорийность, срок годности, хранение', '1.2.0'),
+    ('skills',      'Навыки',                'Умения, процедуры, инструкции, практический опыт в чем-либо',         '1.2.0'),
+    ('food', 'Еда и пищевые продукты', 'Продукты питания, рецепты, рацион, калорийность, сроки годности, условия хранения еды', '1.2.0'),
     ('safety', 'Безопасность', 'Физическая, цифровая и правовая защита, угрозы, инциденты, противодействие', '1.2.0'),
-    ('recipes',     'Рецепты и кулинария',   'Кулинарные рецепты, предпочтения в еде',                 '1.2.0'),
-    ('identity',    'Идентичность',          'Имя, возраст, биография, личные данные',                 '1.2.0'),
-    ('general',     'Общее',                 'Факты, не попавшие в другие домены',                     '1.2.0')
+    ('sport', 'Спорт и физическая подготовка', 'Физическая подготовка человека, единоборства, зарядка, нормативы и подобное', '1.2.0'),
+    ('user_profile','Профиль пользователя',  'Личные данные пользователя, биография, возраст, имя, харакетер, идентичность и все что связано лично с пользователем', '1.2.0'),
+    ('agent_profile','Профиль агента',       'Данные себе как о системе. Идентичность, склонности, личная архитектура, имя системные факты и подобное', '1.2.0'),
+    ('general',     'Общее',                 'Факты и знания о мире в целом, полезные сведения, не попавшее в другие домены',                     '1.2.0')
 ON CONFLICT (code) DO NOTHING;
 
--- 4.20 Таблица гипотез (извлечённых знаний)
+-- 4.20 Строгий справочник тем (иерархия подтем внутри доменов)
+CREATE TABLE IF NOT EXISTS memory.topics (
+    id UUID NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT unique_topic_name UNIQUE (name)
+);
+COMMENT ON TABLE memory.topics IS 'Строгий русскоязычный справочник тем для иерархии внутри доменов. Заполняется отдельным пайплайном после набора гипотез.';
+COMMENT ON COLUMN memory.topics.name IS 'Название темы (справочное значение).';
+
+CREATE INDEX IF NOT EXISTS idx_topics_name ON memory.topics (name);
+CREATE INDEX IF NOT EXISTS idx_topics_timestamp ON memory.topics (created_at);
+
+-- Создаём триггер
+DROP TRIGGER IF EXISTS trg_topics_update_updated_at ON memory.topics;
+CREATE TRIGGER trg_topics_update_updated_at
+    BEFORE UPDATE ON memory.topics
+    FOR EACH ROW
+    EXECUTE FUNCTION common.update_updated_at_column();
+
+-- 4.21 Таблица гипотез (извлечённых знаний)
 CREATE TABLE IF NOT EXISTS memory.hypotheses (
     id UUID NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
-    
-    -- Привязка к пользователю (мультитенантность)
-    actor_id UUID NOT NULL REFERENCES users.actors(id) ON DELETE CASCADE,
-           
     -- Источник
+    dialogue_id UUID REFERENCES dialogs.dialogues(id) ON DELETE SET NULL;
     source_message_ids UUID[] NOT NULL,
-    
     -- Содержимое
     hypothesis_text TEXT NOT NULL,
     domain_code TEXT NOT NULL REFERENCES memory.knowledge_domains(code),
+    topic_id UUID REFERENCES memory.topics(id) ON DELETE SET NULL,
     knowledge_source memory.knowledge_source NOT NULL DEFAULT 'user',
-    entity TEXT,  -- Slug-идентификатор сущности (user_car, village_trips)
-    relation memory.knowledge_relation NOT NULL DEFAULT 'property',
     confidence REAL NOT NULL CHECK (confidence >= 0.0 AND confidence <= 1.0),
-    
     -- Статус верификации
     status memory.hypothesis_status NOT NULL DEFAULT 'draft',
-        
+    -- Интеграция в граф памяти
+    graph_integrated BOOLEAN NOT NULL DEFAULT FALSE,
+    graph_integrated_at TIMESTAMPTZ,
     -- Трассируемость через оркестратор
     orchestrator_step_id UUID REFERENCES orchestrator.orchestrator_steps(id) ON DELETE SET NULL,
     prompt_id UUID REFERENCES orchestrator.prompts(id) ON DELETE RESTRICT,
-    
-    -- Дедупликация (задел под Qdrant)
-    embedding_id UUID,
-    
     -- Метаданные
     agent_version TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1509,27 +1486,26 @@ CREATE TABLE IF NOT EXISTS memory.hypotheses (
     verified_by_actor_id UUID REFERENCES users.actors(id) ON DELETE SET NULL
 );
 COMMENT ON TABLE memory.hypotheses IS 'Извлечённые из диалогов факты, гипотезы, намерения. Проходит стадии: draft → needs_clarification → confirmed/refuted.';
-COMMENT ON COLUMN memory.hypotheses.actor_id IS 'Чьи это знания (мультитенантность)';
+COMMENT ON COLUMN memory.hypotheses.topic_id IS 'Ссылка на справочник тем (memory.topics). Заполняется отдельным пайплайном после набора гипотез.';
 COMMENT ON COLUMN memory.hypotheses.confidence IS 'Уровень уверенности агента: 0.0 (догадка) — 1.0 (точно)';
+COMMENT ON COLUMN memory.hypotheses.dialogue_id IS 'ID диалога, из которого извлечена гипотеза. Заполняется автоматически при экстракции, не требует возврата от LLM.';
 COMMENT ON COLUMN memory.hypotheses.source_message_ids IS 'Массив ID сообщений, из которых извлечена гипотеза';
+COMMENT ON COLUMN memory.hypotheses.graph_integrated IS 'Флаг интеграции гипотезы в граф знаний: FALSE = не обработана, TRUE = интегрирована';
+COMMENT ON COLUMN memory.hypotheses.graph_integrated_at IS 'Время интеграции гипотезы в граф знаний (заполняется при graph_integrated = TRUE)';
 COMMENT ON COLUMN memory.hypotheses.orchestrator_step_id IS 'Шаг оркестратора, в котором была извлечена гипотеза';
 COMMENT ON COLUMN memory.hypotheses.prompt_id IS 'Промпт экстракции из orchestrator.prompts';
-COMMENT ON COLUMN memory.hypotheses.embedding_id IS 'ID вектора в БД Qdrant';
 COMMENT ON COLUMN memory.hypotheses.knowledge_source IS 'Источник знания: user (пользователь), agent (ассистент), external (внешний контекст)';
-COMMENT ON COLUMN memory.hypotheses.entity IS 'Slug-идентификатор главной сущности (user_car, village_trips). Для связности знаний';
-COMMENT ON COLUMN memory.hypotheses.relation IS 'Тип отношения к сущности: property, recommendation, preference, constraint';
 
-CREATE INDEX idx_hypotheses_actor ON memory.hypotheses (actor_id);
 CREATE INDEX idx_hypotheses_status ON memory.hypotheses (status);
+CREATE INDEX idx_hypotheses_dialogue ON memory.hypotheses (dialogue_id);
 CREATE INDEX idx_hypotheses_domain ON memory.hypotheses (domain_code);
+CREATE INDEX idx_hypotheses_topic ON memory.hypotheses (topic_id);
 CREATE INDEX idx_hypotheses_step ON memory.hypotheses (orchestrator_step_id);
 CREATE INDEX idx_hypotheses_prompt ON memory.hypotheses (prompt_id);
 CREATE INDEX idx_hypotheses_confidence ON memory.hypotheses (confidence);
 CREATE INDEX idx_hypotheses_source_messages ON memory.hypotheses USING gin (source_message_ids);
-CREATE INDEX idx_hypotheses_embedding_id ON memory.hypotheses (embedding_id);
 CREATE INDEX idx_hypotheses_knowledge_source ON memory.hypotheses (knowledge_source);
-CREATE INDEX idx_hypotheses_entity ON memory.hypotheses (entity);
-CREATE INDEX idx_hypotheses_relation ON memory.hypotheses (relation);
+CREATE INDEX IF NOT EXISTS idx_hypotheses_not_integrated ON memory.hypotheses (id) WHERE graph_integrated = FALSE AND status = 'confirmed'::memory.hypothesis_status;
 
 -- Триггер update_updated_at для memory.hypotheses
 DROP TRIGGER IF EXISTS trg_hypotheses_update_updated_at ON memory.hypotheses;

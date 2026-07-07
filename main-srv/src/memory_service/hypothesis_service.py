@@ -1,6 +1,8 @@
 """
 main-srv/src/memory_service/hypothesis_service.py
+
 Единый модуль работы с гипотезами долговременной памяти.
+
 Обязанности:
 - Константы лимитов токенов и настроек
 - CRUD гипотез и журнала обработанных сообщений
@@ -8,10 +10,14 @@ main-srv/src/memory_service/hypothesis_service.py
 - Чанкинг по токенам (защита от переполнения контекста)
 - Парсинг JSON-ответа экстрактора с валидацией полей:
   * knowledge_source (user/agent/external) — источник знания
-  * entity (slug) — идентификатор сущности для связности
-  * relation (property/recommendation/preference/constraint) — тип отношения
-Интеграция: через orchestrator_tasks → orchestrator_steps → llm_metrics → hypotheses.
+
+  Интеграция: через orchestrator_tasks → orchestrator_steps → llm_metrics → hypotheses.
 """
+
+__version__ = "1.1.0"
+__description__ = "Unified module for handling long-term memory hypotheses"
+
+
 import json
 import logging
 from typing import List, Dict, Any, Tuple, Optional, Set
@@ -30,13 +36,18 @@ logger = logging.getLogger(__name__)
 EXTRACTION_PROMPT_NAME: str = "memory_hypothesis_extractor"
 
 # Максимум токенов на один чанк (защита от переполнения контекста)
-MAX_CHUNK_TOKENS: int = 10000
+MAX_CHUNK_TOKENS: int = 32768
 
 # Максимум сообщений, выбираемых за один цикл анализа
-MAX_MESSAGES_PER_BATCH: int = 50
+MAX_MESSAGES_PER_BATCH: int = 30
 
 # Минимальный confidence для сохранения гипотезы
 MIN_CONFIDENCE_THRESHOLD: float = 0.3
+
+# Константы обработки топиков гипотез
+TOPIC_CLASSIFICATION_PROMPT_NAME: str = "hypothesis_topic_classifier"
+MAX_TOPIC_BATCH_TOKENS: int = 32768 # Лимит токенов на батч классификации
+MAX_TOPICS_PER_BATCH: int = 30      # Максимум гипотез в одном батче
 
 # =============================================================================
 # === РЕПОЗИТОРИЙ: CRUD и выборки ===
@@ -64,6 +75,7 @@ def get_dialogue_messages(
                 ORDER BY timestamp ASC
             """, (dialogue_id,))
             return [dict(row) for row in cur.fetchall()]
+
 
 def get_unprocessed_dialogues(
     db_config: dict,
@@ -95,7 +107,8 @@ def get_unprocessed_dialogues(
                 LIMIT %s
             """, (limit,))
             return [str(row[0]) for row in cur.fetchall()]
-        
+
+
 def get_unprocessed_closed_messages(
     db_config: dict,
     limit: int = 50
@@ -129,6 +142,7 @@ def get_unprocessed_closed_messages(
             """, (limit,))
             return [dict(row) for row in cur.fetchall()]
 
+
 def get_already_processed_ids(
     db_config: dict,
     message_ids: List[str]
@@ -144,6 +158,7 @@ def get_already_processed_ids(
             """, (message_ids,))
             return {str(row[0]) for row in cur.fetchall()}
 
+
 def get_active_domains_with_descriptions(db_config: dict) -> List[Dict[str, str]]:
     """Возвращает список активных доменов с описаниями для промпта."""
     with psycopg2.connect(**db_config) as conn:
@@ -155,6 +170,7 @@ def get_active_domains_with_descriptions(db_config: dict) -> List[Dict[str, str]
                 ORDER BY code
             """)
             return [dict(row) for row in cur.fetchall()]
+
 
 def get_extraction_prompt(db_config: dict) -> Optional[Dict[str, Any]]:
     """Возвращает активный промпт экстракции из orchestrator.prompts."""
@@ -171,13 +187,14 @@ def get_extraction_prompt(db_config: dict) -> Optional[Dict[str, Any]]:
             row = cur.fetchone()
             return dict(row) if row else None
 
+
 def save_hypotheses(
     db_config: dict,
     hypotheses: List[Dict[str, Any]],
-    actor_id: str,
     orchestrator_step_id: str,
     prompt_id: str,
-    agent_version: str
+    agent_version: str,
+    dialogue_id: Optional[str] = None
 ) -> int:
     """
     Сохраняет извлечённые гипотезы в memory.hypotheses.
@@ -193,35 +210,29 @@ def save_hypotheses(
             count = 0
             for h in hypotheses:
                 status = 'needs_clarification' if h.get('clarification_question') else 'draft'
-                
                 cur.execute("""
                     INSERT INTO memory.hypotheses (
-                        actor_id, domain_code, knowledge_source, entity, relation,
-                        source_message_ids, hypothesis_text, confidence,
-                        status, clarification_question,
-                        orchestrator_step_id, prompt_id, agent_version
+                        domain_code, knowledge_source, source_message_ids, hypothesis_text, confidence,
+                        status, orchestrator_step_id, prompt_id, agent_version, dialogue_id
                     ) VALUES (
-                        %s, %s, %s::memory.knowledge_source, %s, %s::memory.knowledge_relation,
-                        %s::uuid[], %s, %s, %s, %s, %s, %s, %s
+                        %s, %s::memory.knowledge_source, %s::uuid[], %s, %s, %s, %s, %s, %s, %s::uuid
                     )
                 """, (
-                    actor_id,
                     h.get('domain_code', 'general'),
                     h.get('knowledge_source', 'user'),
-                    h.get('entity'),
-                    h.get('relation', 'property'),
                     h.get('source_message_ids', []),
                     h['hypothesis_text'],
                     h.get('confidence', 0.5),
                     status,
-                    h.get('clarification_question'),
                     orchestrator_step_id,
                     prompt_id,
-                    agent_version
+                    agent_version,
+                    dialogue_id  # НОВОЕ
                 ))
                 count += 1
             conn.commit()
             return count
+
 
 def mark_messages_analyzed(
     db_config: dict,
@@ -251,6 +262,70 @@ def mark_messages_analyzed(
                 ))
             conn.commit()
 
+
+def get_unclassified_hypotheses(db_config: dict, limit: int = 100) -> List[Dict[str, Any]]:
+    """Возвращает гипотезы со статусом 'draft' и topic_id IS NULL."""
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, hypothesis_text, domain_code, knowledge_source
+                FROM memory.hypotheses
+                WHERE status = 'draft'::memory.hypothesis_status
+                  AND topic_id IS NULL
+                ORDER BY created_at ASC
+                LIMIT %s
+            """, (limit,))
+            return [dict(row) for row in cur.fetchall()]
+
+
+def get_all_topics(db_config: dict) -> List[Dict[str, str]]:
+    """Возвращает весь справочник тем (с описаниями) для промпта."""
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, name, description FROM memory.topics ORDER BY name")
+            return [dict(row) for row in cur.fetchall()]
+
+
+def assign_topics_to_hypotheses(db_config: dict, assignments: List[Dict[str, Optional[str]]]) -> int:
+    """
+    Обновляет topic_id и переводит статус в 'needs_clarification'.
+    assignments: [{"hypothesis_id": "...", "topic_id": "..." или None}, ...]
+    """
+    if not assignments:
+        return 0
+    updated = 0
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor() as cur:
+            for a in assignments:
+                hyp_id = a.get('hypothesis_id')
+                topic_id = a.get('topic_id')
+                if not hyp_id:
+                    continue
+                cur.execute("""
+                    UPDATE memory.hypotheses
+                    SET topic_id = %s::uuid,
+                        status = 'needs_clarification'::memory.hypothesis_status,
+                        updated_at = NOW()
+                    WHERE id = %s::uuid AND status = 'draft'::memory.hypothesis_status
+                """, (topic_id, hyp_id))
+                updated += cur.rowcount
+            conn.commit()
+    return updated
+
+
+def get_topic_classification_prompt(db_config: dict) -> Optional[Dict[str, Any]]:
+    """Возвращает активный промпт классификатора тем."""
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, text, params FROM orchestrator.prompts
+                WHERE name = %s AND status IN ('testing'::prompt_status, 'active'::prompt_status)
+                ORDER BY created_at DESC LIMIT 1
+            """, (TOPIC_CLASSIFICATION_PROMPT_NAME,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+        
+
 # =============================================================================
 # === ФОРМАТИРОВАНИЕ И ЧАНКИНГ ===
 # =============================================================================
@@ -271,9 +346,9 @@ def format_messages_text(messages: List[Dict[str, Any]]) -> str:
         text = (msg.get('row_text') or "").strip()
         if not text:
             continue
-        # ВСЕ роли показываются с UUID — без исключений
-        lines.append(f"[{role} {msg_id}]: {text}")
+        lines.append(f"[{msg_id}] ({role}): {text}")
     return "\n".join(lines)
+
 
 def chunk_messages_by_tokens(
     messages: List[Dict[str, Any]]
@@ -318,6 +393,7 @@ def chunk_messages_by_tokens(
     logger.debug(f"Messages chunked: {len(messages)} → {len(chunks)} chunks")
     return chunks
 
+
 def render_extraction_prompt(system_prompt_template: str, db_config: dict) -> str:
     """Подставляет активные домены С ОПИСАНИЯМИ в системный промпт экстракции."""
     domains = get_active_domains_with_descriptions(db_config)
@@ -327,6 +403,7 @@ def render_extraction_prompt(system_prompt_template: str, db_config: dict) -> st
         domains_lines.append(f"• \"{d['code']}\" — {desc}")
     domains_str = "\n".join(domains_lines)
     return system_prompt_template.replace("{domains}", domains_str)
+
 
 def build_extraction_user_prompt(
     chunk_messages: List[Dict[str, Any]]
@@ -347,6 +424,7 @@ def build_extraction_user_prompt(
         f"Верни JSON-массив гипотез согласно формату в системном промпте."
     )
     return user_prompt, message_ids
+
 
 def parse_extraction_response(
     raw_response: str,
@@ -396,13 +474,13 @@ def parse_extraction_response(
             except json.JSONDecodeError:
                 logger.error(
                     f"Regex extraction also failed. "
-                    f"Raw response (first 300 chars): {clean[:300]}"
+                    f"Raw response (first 1000 chars): {clean[:1000]}"
                 )
                 return []
         else:
             logger.error(
                 f"No JSON array found in response. "
-                f"Raw response (first 300 chars): {clean[:300]}"
+                f"Raw response (first 1000 chars): {clean[:1000]}"
             )
             return []
     
@@ -501,13 +579,6 @@ def parse_extraction_response(
             if not sources:
                 sources = chunk_message_ids
         
-        # clarification_question — опционально
-        clarification = item.get('clarification_question')
-        if isinstance(clarification, str) and clarification.strip():
-            clarification = clarification.strip()
-        else:
-            clarification = None
-        
         # knowledge_source — валидация источника
         valid_sources = {'user', 'agent', 'external'}
         knowledge_source = item.get('knowledge_source')
@@ -515,29 +586,12 @@ def parse_extraction_response(
             logger.debug(f"Item {i}: invalid knowledge_source '{knowledge_source}', defaulting to 'user'")
             knowledge_source = 'user'
         
-        # entity — slug-идентификатор сущности (опционально)
-        entity = item.get('entity')
-        if isinstance(entity, str) and entity.strip():
-            entity = entity.strip()
-        else:
-            entity = None
-        
-        # relation — валидация типа отношения
-        valid_relations = {'property', 'recommendation', 'preference', 'constraint'}
-        relation = item.get('relation')
-        if not isinstance(relation, str) or relation not in valid_relations:
-            logger.debug(f"Item {i}: invalid relation '{relation}', defaulting to 'property'")
-            relation = 'property'
-        
         valid.append({
             'hypothesis_text': hypothesis_text,
             'domain_code': domain_code,
             'knowledge_source': knowledge_source,
-            'entity': entity,
-            'relation': relation,
             'confidence': confidence,
             'source_message_ids': sources,
-            'clarification_question': clarification
         })
     
     logger.info(

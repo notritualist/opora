@@ -1,25 +1,27 @@
 """
 main-srv/src/memory_service/memory_composer.py
+
 Модуль выполнения задачи извлечения гипотез в долговременную память.
 Аналог response_composer.py для пайплайна user_answer_generation.
+
 Логика:
 - Загрузка промпта экстракции из orchestrator.prompts.
 - Выборка необработанных сообщений из закрытых диалогов.
 - Чанкинг сообщений по токенам (защита от переполнения контекста).
-- Вызов ModelService для извлечения гипотез с полями:
-  * knowledge_source (user/agent/external) — источник знания
-  * entity (slug) — идентификатор сущности для связности
-  * relation (property/recommendation/preference/constraint) — тип отношения
+- Вызов ModelService для извлечения гипотез с полями: knowledge_source (user/agent/external) — источник знания
 - Сохранение гипотез в memory.hypotheses.
 - Запись метрик LLM, артефактов, рассуждений через service_metrics.
 - Пометка сообщений как обработанных в memory.message_analyses.
 - Завершение задачи и шага оркестратора.
+
 Не выполняет прямой работы с очередью задач — это делает orchestrator.
 """
-version = "1.0.0"
+
+version = "1.1.0"
 description = "Composer for memory extraction tasks"
 
 import logging
+from typing import Optional
 
 from services.service_metrics import (
     create_orchestrator_step,
@@ -36,7 +38,8 @@ from db_manager.db_manager import load_postgres_config
 from version import __version__ as agent_version
 
 logger = logging.getLogger(__name__)
-        
+
+
 def compose_memory_extraction(task_id: str, input_data: dict) -> None:
     """
     Выполняет задачу извлечения гипотез в долговременную память.
@@ -137,6 +140,7 @@ def compose_memory_extraction(task_id: str, input_data: dict) -> None:
         total_tokens_used = 0
         total_dialogues_processed = 0
         total_chunks_with_errors = 0
+        last_llm_metric_id: Optional[str] = None
         
         # === 5. Обрабатываем каждый диалог ОТДЕЛЬНО ===
         for dialogue_id in dialogue_ids:
@@ -158,22 +162,13 @@ def compose_memory_extraction(task_id: str, input_data: dict) -> None:
                 logger.info(f"All messages in dialogue {dialogue_id[:8]} already processed")
                 continue
             
-            # 5.3. Определяем actor_id для привязки гипотез
-            actor_id = None
-            for m in messages:
-                if m['actor_type'] in ('user', 'owner'):
-                    actor_id = str(m['actor_id'])
-                    break
-            if not actor_id:
-                actor_id = str(messages[0]['actor_id'])
-            
-            # 5.4. Чанкинг сообщений по токенам
+            # 5.3. Чанкинг сообщений по токенам
             chunks = chunk_messages_by_tokens(messages)
             logger.info(
                 f"Dialogue {dialogue_id[:8]}: {len(messages)} messages → {len(chunks)} chunks"
             )
             
-            # 5.5. Обработка каждого чанка
+            # 5.4. Обработка каждого чанка
             for chunk_idx, chunk in enumerate(chunks):
                 user_prompt, chunk_msg_ids = build_extraction_user_prompt(chunk)
                 
@@ -214,10 +209,10 @@ def compose_memory_extraction(task_id: str, input_data: dict) -> None:
                 saved_count = save_hypotheses(
                     db_config=db_config,
                     hypotheses=hypotheses,
-                    actor_id=actor_id,
                     orchestrator_step_id=step_id,
                     prompt_id=prompt_id,
-                    agent_version=agent_version
+                    agent_version=agent_version,
+                    dialogue_id=dialogue_id  # НОВОЕ
                 )
                 total_hypotheses += saved_count
                 
@@ -245,6 +240,7 @@ def compose_memory_extraction(task_id: str, input_data: dict) -> None:
                     net_latency=0.0,
                     full_time=0.0
                 )
+                last_llm_metric_id = llm_metric_id 
                 total_tokens_used += usage.get("total_tokens", 0)
                 
                 # Сохранение артефактов
@@ -285,7 +281,7 @@ def compose_memory_extraction(task_id: str, input_data: dict) -> None:
             "chunks_with_errors": total_chunks_with_errors,
             "total_tokens": total_tokens_used
         }
-        complete_step_success(step_id, output_data=output_data)
+        complete_step_success(step_id, output_data=output_data, llm_metric_id=last_llm_metric_id)
         complete_task_success(task_id, output_data=output_data)
         logger.info(
             f"Memory extraction completed: {total_hypotheses} hypotheses from "

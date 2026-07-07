@@ -36,13 +36,12 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.styles import Style
-from prompt_toolkit.validation import Validator, ValidationError
 
 from session_services.session_manager import SessionManager
 from services.lifecycle_manager import LifecycleManager
 from orchestrator.orchestrator_entry import schedule_hypothesis_refinement
 from memory_service.verification_service import (
-    get_draft_hypotheses,
+    get_unverified_hypotheses, 
     get_source_context,
     create_session,
     complete_session,
@@ -56,10 +55,17 @@ from memory_service.verification_service import (
 # Получаем логгер для этого модуля
 logger = logging.getLogger(__name__)
 
+
+class PromptInterruptedException(Exception):
+    """
+    Кастомное исключение для прерывания prompt из фонового потока.
+    Позволяет отличить app.exit() (NOTIFY от оркестратора) от нажатия Ctrl+D (EOFError).
+    """
+    pass
+
 # =============================================================================
 # === СТИЛИ ДЛЯ PROMPT_TOOLKIT ===============================================
 # =============================================================================
-
 VERIFICATION_STYLE = Style.from_dict({
     'header':    'bold #00FF00',
     'hypothesis':'#FFFF00',
@@ -79,10 +85,19 @@ def _print_html(html_text: str) -> None:
 def _prompt_html(session: PromptSession, text: str) -> str:
     """Запрашивает ввод с HTML-подсветкой."""
     try:
-        result = session.prompt(HTML(text), style=VERIFICATION_STYLE)
+        result = session.prompt(HTML(text), style=VERIFICATION_STYLE, validator=None)
         if result is None:
             return ""
         return (result or "")
+    except PromptInterruptedException:
+        # Прерывание из фонового потока (NOTIFY) — возвращаем пустую строку
+        return ""
+    except EOFError:
+        # Ctrl+D — пробрасываем наружу для выхода из программы
+        raise
+    except KeyboardInterrupt:
+        # Ctrl+C — игнорируем
+        return ""
     except Exception:
         return ""
 
@@ -138,7 +153,7 @@ def create_prompt_session(session_manager: SessionManager) -> PromptSession:
         event.current_buffer.validate_and_handle()
     @bindings.add('c-d')
     def _(event):
-        raise KeyboardInterrupt()
+        event.app.exit(exception=EOFError())
     @bindings.add('c-c')
     def _(event):
         pass
@@ -158,36 +173,32 @@ def create_prompt_session(session_manager: SessionManager) -> PromptSession:
 def get_user_input(session: PromptSession) -> str:
     """
     Получает ввод от пользователя.
-    Выбрасывает KeyboardInterrupt при Ctrl+D.
-    Возвращает пустую строку, если prompt был прерван извне (событием верификации).
     """
     try:
-        result = session.prompt(message='\n👤 You: ')
+        result = session.prompt(message='\n👤 You: ', validator=None)
         if result is None:
             return ""
         return (result or "").strip()
-    except (EOFError, KeyboardInterrupt):
-        raise KeyboardInterrupt()
+    except PromptInterruptedException:
+        # Прерывание из фонового потока (NOTIFY) — просто возвращаем управление в цикл
+        return ""
+    except EOFError:
+        # Ctrl+D — пробрасываем для корректного выхода из программы
+        raise
+    except KeyboardInterrupt:
+        # Ctrl+C — игнорируется
+        return ""
     except Exception:
         return ""
 
 # =============================================================================
 # === SHUTDOWN REASON PROMPT (PROMPT_TOOLKIT + DB ENUM) =====================
 # =============================================================================
-class ShutdownReasonValidator(Validator):
-    """Валидатор для выбора причины выключения (число от 1 до N)."""
-    def __init__(self, max_choice: int):
-        self.max_choice = max_choice
-    def validate(self, document):
-        text = document.text.strip()
-        if not text.isdigit() or not (1 <= int(text) <= self.max_choice):
-            raise ValidationError(message=f'Введите число от 1 до {self.max_choice}')
-
 def _prompt_shutdown_reason_ui(prompt_session: PromptSession, lifecycle_mgr: LifecycleManager) -> str:
     """
     Запрашивает причину выключения через prompt_toolkit.
-    Использует значения ENUM из БД через lifecycle_mgr._get_shutdown_types_from_db().
-    Работает стабильно в VSCode/debugpy, блокирует Ctrl+C согласно биндингам.
+    Валидация вынесена в Python-код, чтобы избежать загрязнения состояния 
+    PromptSession при прерывании через app.exit() из фонового потока.
     """
     reasons = lifecycle_mgr._get_shutdown_types_from_db()
     if not reasons:
@@ -202,11 +213,18 @@ def _prompt_shutdown_reason_ui(prompt_session: PromptSession, lifecycle_mgr: Lif
         try:
             choice = prompt_session.prompt(
                 f'Your choice (1-{len(reasons)}): ',
-                validator=ShutdownReasonValidator(len(reasons)),
                 validate_while_typing=False
             ).strip()
+            
             if choice.isdigit() and 1 <= int(choice) <= len(reasons):
                 return reasons[int(choice) - 1]
+            else:
+                print_formatted_text(HTML(f'<error>Введите число от 1 до {len(reasons)}</error>'))
+        except PromptInterruptedException:
+            continue
+        except EOFError:
+            # Ctrl+D — пробрасываем для выхода
+            raise
         except KeyboardInterrupt:
             print_formatted_text(HTML('\n<warning>Interrupted. Using default: crash</warning>'))
             return 'crash'
@@ -236,8 +254,14 @@ def _verification_event_listener(db_config: dict, event_queue: queue.Queue, stop
                 notify = conn.notifies.pop(0)
                 logger.info(f"Received NOTIFY: {notify.payload}")
                 event_queue.put(notify.payload)
+
+                # === ИСПРАВЛЕНИЕ: Прерываем блокирующий prompt ===
                 if prompt_session and hasattr(prompt_session, 'app') and prompt_session.app:
-                    prompt_session.app.exit()
+                    try:
+                        prompt_session.app.exit(exception=PromptInterruptedException())
+                    except Exception as e:
+                        logger.debug(f"Failed to exit prompt app: {e}")
+
     except Exception as e:
         if not stop_event.is_set():
             logger.error(f"Verification listener error: {e}", exc_info=True)
@@ -264,7 +288,7 @@ def run_verification_mode(
         draft_count: количество hypothesis (для метрик)
         session_id: существующая active-сессия (созданная до диалога [Y]/[N])
     """
-    hypotheses = get_draft_hypotheses(db_config, actor_id)
+    hypotheses = get_unverified_hypotheses(db_config)
     if not hypotheses:
         _print_html("<context>Нет гипотез для верификации.</context>\n")
         if session_id:
@@ -273,7 +297,7 @@ def run_verification_mode(
     
     # Используем существующую сессию или создаём новую (fallback)
     if not session_id:
-        session_id = create_session(db_config, actor_id, len(hypotheses))
+        session_id = create_session(db_config, len(hypotheses))
     total = len(hypotheses)
     _print_html(f"\n<header>{'='*60}</header>")
     _print_html(f"<header>  🔬 РЕЖИМ ВЕРИФИКАЦИИ ({total} гипотез)</header>")
@@ -283,15 +307,14 @@ def run_verification_mode(
         hyp_text = hyp['hypothesis_text']
         confidence = hyp.get('confidence', 0.0)
         domain_code = hyp.get('domain_code', 'unknown')
+        topic_name = hyp.get('topic_name') or (str(hyp.get('topic_id', ''))[:8] if hyp.get('topic_id') else 'Без темы')
         knowledge_source = hyp.get('knowledge_source', 'unknown')
-        entity = hyp.get('entity', 'unknown')
-        relation = hyp.get('relation', 'unknown')
         source_ids = hyp.get('source_message_ids') or []
         _print_html(
             f"\n<action>── Гипотеза {idx}/{total} ──</action>"
             f"\n<context>  📊 Уверенность: {confidence:.0%}</context>"
             f"\n<context>  🏷️ Домен: {domain_code} | Источник: {knowledge_source}</context>"
-            f"\n<context>  🔗 Сущность: {entity} | Связь: {relation}</context>"
+            f"\n<context>  📚 Тема: {topic_name}</context>"
             f"\n<context>  🆔 ID: {hyp_id[:8]}</context>"
             f"\n<hypothesis>  📌 {hyp_text}</hypothesis>"
         )
@@ -309,15 +332,15 @@ def run_verification_mode(
                 _show_source_context(db_config, source_ids)
                 continue
             elif action == 'y':
-                record_action(db_config, session_id, hyp_id, actor_id, 'confirmed')
+                record_action(db_config, session_id, hyp_id, 'confirmed')
                 _print_html("<success>  ✅ Подтверждено</success>")
                 action_taken = True
             elif action == 'n':
-                record_action(db_config, session_id, hyp_id, actor_id, 'rejected')
+                record_action(db_config, session_id, hyp_id, 'rejected')
                 _print_html("<error>  ❌ Отклонено</error>")
                 action_taken = True
             elif action == 's':
-                record_action(db_config, session_id, hyp_id, actor_id, 'skipped')
+                record_action(db_config, session_id, hyp_id, 'skipped')
                 _print_html("<context>  ⏭ Пропущено</context>")
                 action_taken = True
             elif action == 'e':
@@ -387,80 +410,98 @@ def _handle_edit_mode(db_config: dict, session_id: str, hypothesis: dict, actor_
     
     _print_html("\n<action>✏️  Режим редактирования</action>")
     _show_source_context(db_config, source_ids)
-    _print_html("<action>  Введите комментарий/исправление (пустая строка для завершения):</action>")
     
+    # === 1. ЗАПРОС МЕТАДАННЫХ ===
+    new_domain, new_source, new_topic_id, new_topic_name, metadata_changed = _prompt_metadata_edit(
+        db_config, hypothesis, prompt_session
+    )
+    
+    # === 2. ЗАПРОС КОММЕНТАРИЯ К ТЕКСТУ ===
+    _print_html("<action>  Введите комментарий/исправление текста (пустая строка для пропуска):</action>")
     comment_lines = []
     while True:
         line = _prompt_html(prompt_session, "  <context>> </context>")
         if not line or not line.strip():
             break
         comment_lines.append(line)
-    
     user_comment = "\n".join(comment_lines).strip()
-    if not user_comment:
-        _print_html("<warning>  Комментарий пуст, редактирование отменено.</warning>")
+    
+    if not user_comment and not metadata_changed:
+        _print_html("<warning>  Никаких изменений не внесено.</warning>")
         return
     
-    context_msgs = get_source_context(db_config, source_ids, context_window=0)
-    source_context = "\n".join(f"[{m.get('actor_type','?')}]: {(m.get('row_text') or '')}" for m in context_msgs)
+    # === 3. Формируем metadata_updates для композера ===
+    metadata_updates = {}
+    if metadata_changed:
+        metadata_updates = {
+            'domain_code': new_domain,
+            'knowledge_source': new_source,
+            'topic_id': new_topic_id,
+        }
     
+    # === 4. ЗАПУСК ЗАДАЧИ (композер сделает всё атомарно) ===
     _print_html("<action>  ⚙️ Генерация уточнённой версии через LLM...</action>")
-    
     try:
         task_id = schedule_hypothesis_refinement(
             hypothesis_id=hyp_id,
-            user_comment=user_comment,
+            user_comment=user_comment or "[metadata update only]",
             verification_session_id=session_id,
+            metadata_updates=metadata_updates,
         )
         refined_text = _wait_for_refinement_result(db_config, task_id, timeout=120)
         if not refined_text:
             _print_html("<error>  ⚠ Не удалось получить уточнённую гипотезу.</error>")
-            record_action(db_config, session_id, hyp_id, actor_id, 'skipped', user_comment=user_comment)
             return
+        
+        # === 5. ПОДТВЕРЖДЕНИЕ РЕЗУЛЬТАТА ===
         _print_html(f"\n<success>  📝 Уточнённая гипотеза:</success>")
         _print_html(f"<hypothesis>  {refined_text}</hypothesis>")
-        accept_raw = _prompt_html(prompt_session, "\n<action>Принять уточнение? [Y] да / [N] нет: </action>")
+        if metadata_changed:
+            _print_html(f"<context>  📋 Метаданные обновлены: домен={new_domain}, источник={new_source}, тема={new_topic_name}</context>")
+        
+        accept_raw = _prompt_html(prompt_session, "\n<action>Принять изменения? [Y] да / [N] откатить: </action>")
         accept = (accept_raw or "").strip().lower()
-        step_id, prompt_id = _get_task_step_info(db_config, task_id)
+        
         if accept in ('y', 'yes', 'д', 'да'):
-            # Обновляем гипотезу (action уже создан композером)
+            # Увеличиваем счётчик сессии
             with psycopg2.connect(**db_config) as conn:
                 with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE memory.hypotheses
-                        SET hypothesis_text = %s,
-                            status = 'confirmed'::memory.hypothesis_status,
-                            updated_at = NOW(),
-                            verified_at = NOW(),
-                            verified_by_actor_id = %s::uuid
-                        WHERE id = %s::uuid
-                    """, (refined_text, actor_id, hyp_id))
                     cur.execute("""
                         UPDATE memory.verification_sessions
                         SET hypotheses_edited = hypotheses_edited + 1
                         WHERE id = %s::uuid
                     """, (session_id,))
                     conn.commit()
-            _print_html("<success>  ✅ Гипотеза обновлена и подтверждена</success>")
+            _print_html("<success>  ✅ Изменения применены</success>")
         else:
-            # Откат: action → skipped, гипотеза не меняется
+            # Откат: восстанавливаем старый текст и метаданные
             with psycopg2.connect(**db_config) as conn:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT output_data FROM orchestrator.orchestrator_tasks WHERE id = %s", (task_id,))
-                    row = cur.fetchone()
-                    if row and row[0] and row[0].get('verification_action_id'):
-                        cur.execute("""
-                            UPDATE memory.verification_actions
-                            SET action_type = 'skipped'::memory.verification_action_type
-                            WHERE id = %s::uuid
-                        """, (row[0]['verification_action_id'],))
-                        cur.execute("""
-                            UPDATE memory.verification_sessions
-                            SET hypotheses_skipped = hypotheses_skipped + 1
-                            WHERE id = %s::uuid
-                        """, (session_id,))
+                    cur.execute("""
+                        UPDATE memory.hypotheses
+                        SET hypothesis_text = %s,
+                            status = 'draft'::memory.hypothesis_status,
+                            domain_code = %s,
+                            knowledge_source = %s,
+                            topic_id = %s::uuid,
+                            updated_at = NOW()
+                        WHERE id = %s::uuid
+                    """, (
+                        hyp_text,
+                        hypothesis.get('domain_code'),
+                        hypothesis.get('knowledge_source'),
+                        hypothesis.get('topic_id'),
+                        hyp_id
+                    ))
+                    cur.execute("""
+                        UPDATE memory.verification_actions
+                        SET action_type = 'skipped'::memory.verification_action_type
+                        WHERE hypothesis_id = %s::uuid AND session_id = %s::uuid
+                        ORDER BY created_at DESC LIMIT 1
+                    """, (hyp_id, session_id))
                     conn.commit()
-            _print_html("<context>  Уточнение отклонено.</context>")
+            _print_html("<context>  ⏪ Изменения откатаны</context>")
+    
     except Exception as e:
         logger.error("Edit mode error: %s", e, exc_info=True)
         _print_html(f"<error>  ❌ Ошибка: {e}</error>")
@@ -484,30 +525,6 @@ def _wait_for_refinement_result(db_config: dict, task_id: str, timeout: int = 12
         time.sleep(0.5)
     return None
 
-def _get_task_step_info(db_config: dict, task_id: str) -> tuple:
-    """
-    Возвращает (step_id, prompt_id) для задачи hypothesis_refinement.
-    step_id берётся из orchestrator_steps.id
-    prompt_id берётся из metrics.llm_internal.prompt_id через llm_metric_id
-    """
-    try:
-        with psycopg2.connect(**db_config) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT s.id, m.prompt_id
-                    FROM orchestrator.orchestrator_steps s
-                    LEFT JOIN metrics.llm_internal m ON m.orchestrator_step_id = s.id
-                    WHERE s.task_id = %s
-                    ORDER BY s.created_at DESC
-                    LIMIT 1
-                """, (task_id,))
-                row = cur.fetchone()
-                if row:
-                    return (str(row[0]), str(row[1]) if row[1] else None)
-    except Exception as e:
-        logger.warning("Failed to get step info for task %s: %s", 
-                      task_id[:8] if task_id else 'None', e)
-    return None, None
 
 def _print_verification_summary(db_config: dict, session_id: str) -> None:
     try:
@@ -528,6 +545,78 @@ def _print_verification_summary(db_config: dict, session_id: str) -> None:
     _print_html(f"<action>  ✏️ Изм.:    {s.get('hypotheses_edited', 0)}</action>")
     _print_html(f"<context>  ⏭ Пропущ.: {s.get('hypotheses_skipped', 0)}</context>")
     _print_html(f"<header>{'─'*40}</header>\n")
+
+def _prompt_metadata_edit(db_config: dict, hyp: dict, prompt_session: PromptSession) -> tuple:
+    """
+    Запрашивает новые значения домена, источника и темы через UI.
+    Возвращает (domain_code, knowledge_source, topic_id, changed).
+    """
+    current_domain = hyp.get('domain_code', 'unknown')
+    current_source = hyp.get('knowledge_source', 'unknown')
+    current_topic_id = hyp.get('topic_id')
+    current_topic_name = hyp.get('topic_name') or 'Без темы'
+    
+    _print_html("\n<action>📋 Редактирование метаданных (Enter = оставить текущее)</action>")
+    
+    # Домен
+    new_domain = _prompt_html(
+        prompt_session,
+        f"<context>  🏷️ Домен (текущий: {current_domain}): </context>"
+    ).strip()
+    if not new_domain:
+        new_domain = current_domain
+    
+    # Источник
+    new_source = _prompt_html(
+        prompt_session,
+        f"<context>  📚 Источник (текущий: {current_source}): </context>"
+    ).strip()
+    if not new_source:
+        new_source = current_source
+    
+    # Тема
+    new_topic_name = _prompt_html(
+        prompt_session,
+        f"<context>  📖 Тема (текущая: {current_topic_name}): </context>"
+    ).strip()
+    
+    new_topic_id = current_topic_id
+    topic_changed = False
+    if new_topic_name:
+        if new_topic_name.lower() in ('без темы', 'none', 'нет', '-'):
+            new_topic_id = None
+            topic_changed = True
+        elif new_topic_name != current_topic_name:
+            # Ищем или создаём тему в БД
+            try:
+                with psycopg2.connect(**db_config) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT id FROM memory.topics WHERE name = %s", (new_topic_name,))
+                        row = cur.fetchone()
+                        if row:
+                            new_topic_id = str(row[0])
+                        else:
+                            cur.execute(
+                                "INSERT INTO memory.topics (name) VALUES (%s) RETURNING id",
+                                (new_topic_name,)
+                            )
+                            new_topic_id = str(cur.fetchone()[0])
+                        conn.commit()
+                topic_changed = True
+            except Exception as e:
+                logger.warning(f"Failed to get/create topic: {e}")
+                _print_html(f"<error>  ⚠ Ошибка работы с темой: {e}</error>")
+                new_topic_id = current_topic_id
+    
+    changed = (
+        new_domain != current_domain or
+        new_source != current_source or
+        topic_changed
+    )
+    
+    # Возвращаем имя темы для красивого вывода в UI
+    display_topic_name = new_topic_name if new_topic_name else 'Без темы'
+    return new_domain, new_source, new_topic_id, display_topic_name, changed
 
 # =============================================================================
 # === ГЛАВНАЯ ТОЧКА ВХОДА ====================================================
@@ -573,7 +662,9 @@ def run_console_interface(db_config: dict, agent_version: str, lifecycle_mgr: Li
         logger.info(f"New dialog session created: {session_id}")
         _print_status(f"Session #{session_id[:8]} started", True)
         _print_welcome(agent_version, console_user_id, session_service.actor_type)
-        
+        print("💡 Разделять смысловые темы через Ctrl+N — это улучшит качество извлечения фактов в память.")
+        print("   Диалог автоматически завершается по константе неактивности и создается новый.\n")
+
         listener_thread = threading.Thread(
             target=_verification_event_listener,
             args=(db_config, event_queue, stop_listener, prompt_session),
@@ -611,8 +702,8 @@ def run_console_interface(db_config: dict, agent_version: str, lifecycle_mgr: Li
                             hypothesis_ids = payload.get('hypothesis_ids', [])
                             # Создаём сессию как 'active'. Пока она active — оркестратор не спамит.
                             temp_session_id = create_session(
-                                db_config, session_service.actor_id, draft_count,
-                                proposal_task_id=proposal_task_id,
+                                db_config, draft_count,
+                                proposal_task_id=str(proposal_task_id),
                                 hypothesis_ids=hypothesis_ids
                             )
                             
@@ -622,7 +713,7 @@ def run_console_interface(db_config: dict, agent_version: str, lifecycle_mgr: Li
                                 "<action>Верифицировать сейчас? [Y] да / [N] отложить: </action>"
                             )
                             answer = (answer_raw or "").strip().lower()
-                            
+                                                        
                             if answer in ('y', 'yes', 'д', 'да'):
                                 # Передаём существующую active-сессию в режим верификации
                                 run_verification_mode(
@@ -649,7 +740,7 @@ def run_console_interface(db_config: dict, agent_version: str, lifecycle_mgr: Li
                     except queue.Empty:
                         pass  # очередь пуста — идём к вводу пользователя
                     
-                    # 2. СТАНДАРТНЫЙ ВВОД ПОЛЬЗОВАТЕЛЯ (теперь достижим!)
+                    # 2. СТАНДАРТНЫЙ ВВОД ПОЛЬЗОВАТЕЛЯ
                     user_input = get_user_input(prompt_session)
                     if user_input.lower() in ("exit", "выход"):
                         exit_reason = "user_command"
@@ -671,6 +762,10 @@ def run_console_interface(db_config: dict, agent_version: str, lifecycle_mgr: Li
                     else:
                         print(f"\r{' ' * len(status_text)}\r🤖 Agent: [No response received]\n", end="", flush=True)
                 except KeyboardInterrupt:
+                    exit_reason = "user_exit"
+                    break
+                except EOFError:
+                    # === НОВОЕ: Корректный выход по Ctrl+D ===
                     exit_reason = "user_exit"
                     break
                 except Exception as e:
