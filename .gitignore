@@ -20,6 +20,8 @@ logs/
 # IDE/editor
 .vscode/
 docs/workbook
+docs/ideas
+docs/tasks
 README_ru.md
 README.md
 *.swp
