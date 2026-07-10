@@ -17,7 +17,7 @@ main-srv/src/memory_service/verification_service.py
 Связывает memory.hypotheses с memory.verification_sessions и orchestrator.orchestrator_steps.
 """
 
-version = "1.1.0"
+version = "1.1.1"
 description = "Hypothesis verification session management"
 
 import logging
@@ -286,11 +286,13 @@ def record_action(
     session_id: str,
     hypothesis_id: str,
     action_type: str,  # confirmed | rejected | edited | skipped
+    actor_id: Optional[str] = None,
     original_text: Optional[str] = None,
     updated_text: Optional[str] = None,
     user_comment: Optional[str] = None,
     orchestrator_step_id: Optional[str] = None,
     prompt_id: Optional[str] = None,
+    metadata_updates: Optional[Dict[str, Any]] = None,  # ← НОВОЕ
 ) -> str:
     """
     Записывает действие верификации и обновляет статус гипотезы.
@@ -304,7 +306,7 @@ def record_action(
         'skipped': None,  # Не меняем статус
     }
     new_hypothesis_status = status_map.get(action_type)
-
+    
     conn = psycopg2.connect(**db_config)
     try:
         with conn.cursor() as cur:
@@ -326,7 +328,7 @@ def record_action(
                 orchestrator_step_id, prompt_id,
             ))
             action_id = str(cur.fetchone()[0])
-
+            
             # 2. Обновляем статус гипотезы и метаданные верификации
             if new_hypothesis_status:
                 if action_type == 'edited' and updated_text:
@@ -338,7 +340,7 @@ def record_action(
                             verified_at = NOW(),
                             verified_by_actor_id = %s::uuid
                         WHERE id = %s::uuid
-                    """, (new_hypothesis_status, updated_text, hypothesis_id))
+                    """, (new_hypothesis_status, updated_text, actor_id, hypothesis_id))
                 else:
                     cur.execute("""
                         UPDATE memory.hypotheses
@@ -347,8 +349,33 @@ def record_action(
                             verified_at = NOW(),
                             verified_by_actor_id = %s::uuid
                         WHERE id = %s::uuid
-                    """, (new_hypothesis_status, hypothesis_id))
-
+                    """, (new_hypothesis_status, actor_id, hypothesis_id))
+                
+                # === НОВОЕ: Обновляем метаданные, если переданы ===
+                if metadata_updates:
+                    update_fields = []
+                    update_params = []
+                    
+                    if 'domain_code' in metadata_updates:
+                        update_fields.append("domain_code = %s")
+                        update_params.append(metadata_updates['domain_code'])
+                    
+                    if 'knowledge_source' in metadata_updates:
+                        update_fields.append("knowledge_source = %s")
+                        update_params.append(metadata_updates['knowledge_source'])
+                    
+                    if 'topic_id' in metadata_updates:
+                        update_fields.append("topic_id = %s::uuid")
+                        update_params.append(metadata_updates['topic_id'])
+                    
+                    if update_fields:
+                        update_params.append(hypothesis_id)
+                        cur.execute(f"""
+                            UPDATE memory.hypotheses
+                            SET {', '.join(update_fields)}, updated_at = NOW()
+                            WHERE id = %s::uuid
+                        """, update_params)
+            
             # 3. Обновляем счётчики сессии
             counter_column = f"hypotheses_{action_type}" if action_type != 'confirmed' else "hypotheses_confirmed"
             cur.execute(f"""
@@ -356,14 +383,13 @@ def record_action(
                 SET {counter_column} = {counter_column} + 1
                 WHERE id = %s::uuid
             """, (session_id,))
-
+            
             conn.commit()
             logger.debug(
                 "Verification action recorded: %s | hypothesis=%s | type=%s",
                 action_id[:8], hypothesis_id[:8], action_type
             )
             return action_id
-
     except Exception as e:
         conn.rollback()
         logger.error("Error recording verification action: %s", e, exc_info=True)

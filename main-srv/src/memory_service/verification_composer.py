@@ -24,7 +24,7 @@ orchestrator.prompts, orchestrator.orchestrator_steps, orchestrator.orchestrator
 metrics.llm_internal, metrics.llm_artifacts, orchestrator.reasonings.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 __description__ = "Composer for verification and hypothesis refinement tasks"
 
 import json
@@ -140,17 +140,20 @@ def compose_verification_proposal(task_id: str, input_data: dict) -> None:
 def compose_hypothesis_refinement(task_id: str, input_data: dict) -> None:
     """
     Выполняет задачу hypothesis_refinement.
-    LLM-уточнение гипотезы на основе комментария пользователя.
+    ТОЛЬКО генерирует уточнённый текст через LLM.
+    НЕ обновляет гипотезу в БД - это делает консоль после подтверждения пользователем.
     """
     db_config = load_postgres_config()
     step_id = None
-    
     try:
         hypothesis_id = input_data["hypothesis_id"]
         user_comment = input_data["user_comment"]
         metadata_updates = input_data.get("metadata_updates") or {}
 
-        # Получаем hypothesis_text, actor_id и source_message_ids из БД
+        # === НОВОЕ: Определяем, нужен ли LLM ===
+        is_comment_empty = not user_comment or not user_comment.strip()
+
+        # Получаем hypothesis_text и source_message_ids из БД
         with psycopg2.connect(**db_config) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
@@ -163,201 +166,170 @@ def compose_hypothesis_refinement(task_id: str, input_data: dict) -> None:
                     raise RuntimeError(f"Hypothesis {hypothesis_id} not found")
                 hypothesis_text = hyp_row['hypothesis_text']
                 source_message_ids = hyp_row['source_message_ids'] or []
-        
-        # Получаем source_context из сообщений-источников
-        from memory_service.verification_service import get_source_context
-        source_msgs = get_source_context(db_config, source_message_ids, context_window=0)
-        source_context_parts = []
-        for m in source_msgs:
-            role = 'User' if m.get('actor_type') == 'owner' else 'Agent'
-            text = (m.get('row_text') or '').strip()
-            source_context_parts.append(f"[{role}]: {text}")
-        source_context = "\n".join(source_context_parts)
-        
-        # 1. Загрузка промпта из БД
-        with psycopg2.connect(**db_config) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, text, params
-                    FROM orchestrator.prompts
-                    WHERE name = %s
-                      AND status IN ('testing'::public.prompt_status, 'active'::public.prompt_status)
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """, (REFINEMENT_PROMPT_NAME,))
-                prompt_row = cur.fetchone()
-                
-                if not prompt_row:
-                    raise RuntimeError(f"Prompt '{REFINEMENT_PROMPT_NAME}' not found in orchestrator.prompts")
-                
-                prompt_id = str(prompt_row[0])
-                prompt_template = prompt_row[1]
-                model_params = prompt_row[2] or {}
-        
-        # 2. Подстановка переменных
-        prompt_text = (
-            prompt_template
-            .replace("{{hypothesis_text}}", hypothesis_text)
-            .replace("{{source_context}}", source_context)
-            .replace("{{user_comment}}", user_comment)
-        )
-        
-        # 3. Создание шага оркестратора
-        step_id = create_orchestrator_step(
-            task_id=task_id,
-            step_number=1,
-            step_type_name="hypothesis_refinement",
-            input_data={
-                "hypothesis_id": input_data.get("hypothesis_id"),
-                "user_comment_length": len(user_comment),
-                "verification_session_id": input_data.get("verification_session_id"),
-            }
-        )
-        
-        # 4. Вызов LLM через ModelService
-        model_name = model_params.get("model_name")
-        if not model_name:
-            raise RuntimeError(f"Prompt '{REFINEMENT_PROMPT_NAME}' has no 'model_name' in params")
-        
-        model = ModelService()
-        model_info = model.get_model_info(model_name)
-        n_ctx = model_info.get("n_ctx", 32768)
-        
-        safe_params = {
-            k: v for k, v in model_params.items()
-            if k in [
-                "temperature", "top_p", "top_k", "min_p", "max_tokens",
-                "presence_penalty", "repetition_penalty", "stop", "chat_template_kwargs"
-            ]
-        }
-        
-        messages_for_llm = [{"role": "user", "content": prompt_text}]
-        
-        result = model.generate(
-            messages=messages_for_llm,
-            model_name=model_name,
-            **safe_params
-        )
-        
-        if not result.get("success"):
-            raise RuntimeError(f"LLM generation failed: {result.get('error')}")
-        
-        refined_text = (result.get("content") or result.get("response") or "").strip()
-        raw_response = result.get("raw_response") or refined_text
-        reasoning_text = result.get("reasoning_content") or result.get("reasoning")
-        metrics = result.get("metrics", {})
-        timings = metrics.get("timings", {})
-        usage = metrics.get("usage", {})
-        
-        # 5. Сохранение метрик LLM
-        llm_metric_id = save_llm_metrics(
-            orchestrator_step_id=step_id,
-            prompt_id=prompt_id,
-            host="main-srv",
-            model=metrics.get("model", model_name),
-            param=safe_params,
-            cache_n=timings.get("cache_n", 0),
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-            total_tokens=usage.get("total_tokens", 0),
-            host_nctx=metrics.get("host_nctx", n_ctx),
-            prompt_ms=timings.get("prompt_ms", 0.0),
-            prompt_per_token_ms=timings.get("prompt_per_token_ms", 0.0),
-            prompt_per_second=timings.get("prompt_per_second", 0.0),
-            predicted_per_second=timings.get("predicted_per_second", 0.0),
-            resp_time=timings.get("predicted_ms", 0.0) / 1000,
-            net_latency=0.0,
-            full_time=0.0
-        )
-        
-        # 6. Сохранение артефактов
-        save_llm_artifacts(
-            llm_metric_id=llm_metric_id,
-            orchestrator_step_id=step_id,
-            messages=messages_for_llm,
-            raw_response=raw_response,
-            final_params=safe_params
-        )
-        
-        # 7. Сохранение рассуждений (если есть)
-        if reasoning_text and reasoning_text.strip():
-            save_reasoning(
-                orchestrator_step_id=step_id,
-                content=reasoning_text.strip(),
-                content_type="reflection"
+
+        # Значения по умолчанию для лёгкого режима
+        refined_text = hypothesis_text
+        prompt_id = None
+        llm_metric_id = None
+        reasoning_text = None
+        raw_response = ""
+
+        if is_comment_empty:
+            # ================================================================
+            # ЛЁГКИЙ РЕЖИМ: только метаданные, LLM пропускаем
+            # ================================================================
+            logger.info(
+                "Empty comment — skipping LLM for hypothesis %s (metadata-only update)",
+                hypothesis_id[:8]
             )
-        
-        # === 8. Атомарное обновление гипотезы и создание verification_action ===
-        verification_session_id = input_data.get("verification_session_id")
-        verification_action_id = None
-        if verification_session_id:
+            step_id = create_orchestrator_step(
+                task_id=task_id,
+                step_number=1,
+                step_type_name="hypothesis_refinement",
+                input_data={
+                    "hypothesis_id": hypothesis_id,
+                    "mode": "metadata_only",
+                    "user_comment_length": 0,
+                    "verification_session_id": input_data.get("verification_session_id"),
+                }
+            )
+        else:
+            # ================================================================
+            # СТАНДАРТНЫЙ РЕЖИМ: LLM-уточнение
+            # ================================================================
+            # Получаем source_context из сообщений-источников
+            from memory_service.verification_service import get_source_context
+            source_msgs = get_source_context(db_config, source_message_ids, context_window=0)
+            source_context_parts = []
+            for m in source_msgs:
+                role = 'User' if m.get('actor_type') == 'owner' else 'Agent'
+                text = (m.get('row_text') or '').strip()
+                source_context_parts.append(f"[{role}]: {text}")
+            source_context = "\n".join(source_context_parts)
+
+            # 1. Загрузка промпта из БД
             with psycopg2.connect(**db_config) as conn:
                 with conn.cursor() as cur:
-                    # Обновляем текст гипотезы
                     cur.execute("""
-                        UPDATE memory.hypotheses
-                        SET hypothesis_text = %s,
-                            status = 'confirmed'::memory.hypothesis_status,
-                            updated_at = NOW(),
-                            verified_at = NOW()
-                        WHERE id = %s::uuid
-                    """, (refined_text, hypothesis_id))
-                    
-                    # === НОВОЕ: Обновляем метаданные, если переданы ===
-                    if metadata_updates:
-                        update_fields = []
-                        update_params = []
-                        if 'domain_code' in metadata_updates:
-                            update_fields.append("domain_code = %s")
-                            update_params.append(metadata_updates['domain_code'])
-                        if 'knowledge_source' in metadata_updates:
-                            update_fields.append("knowledge_source = %s")
-                            update_params.append(metadata_updates['knowledge_source'])
-                        if 'topic_id' in metadata_updates:
-                            update_fields.append("topic_id = %s::uuid")
-                            update_params.append(metadata_updates['topic_id'])
-                        
-                        if update_fields:
-                            update_params.append(hypothesis_id)
-                            cur.execute(f"""
-                                UPDATE memory.hypotheses
-                                SET {', '.join(update_fields)}, updated_at = NOW()
-                                WHERE id = %s::uuid
-                            """, update_params)
-                    
-                    # Формируем итоговый комментарий с пометкой об изменении метаданных
-                    final_comment = user_comment or ""
-                    if metadata_updates:
-                        meta_note = f"[metadata: {', '.join(f'{k}={v}' for k, v in metadata_updates.items())}]"
-                        final_comment = f"{final_comment} {meta_note}".strip()
-                    
-                    # Создаём verification_action
-                    cur.execute("""
-                        INSERT INTO memory.verification_actions (
-                            session_id, hypothesis_id, action_type,
-                            original_text, updated_text, user_comment,
-                            orchestrator_step_id, prompt_id
-                        ) VALUES (
-                            %s::uuid, %s::uuid, 'edited'::memory.verification_action_type,
-                            %s, %s, %s, %s::uuid, %s::uuid
-                        )
-                        RETURNING id
-                    """, (
-                        verification_session_id, hypothesis_id,
-                        hypothesis_text, refined_text, final_comment,
-                        step_id, prompt_id
-                    ))
-                    verification_action_id = str(cur.fetchone()[0])
-                    conn.commit()
-        
+                        SELECT id, text, params
+                        FROM orchestrator.prompts
+                        WHERE name = %s
+                          AND status IN ('testing'::public.prompt_status, 'active'::public.prompt_status)
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    """, (REFINEMENT_PROMPT_NAME,))
+                    prompt_row = cur.fetchone()
+                    if not prompt_row:
+                        raise RuntimeError(f"Prompt '{REFINEMENT_PROMPT_NAME}' not found in orchestrator.prompts")
+                    prompt_id = str(prompt_row[0])
+                    prompt_template = prompt_row[1]
+                    model_params = prompt_row[2] or {}
+
+            # 2. Подстановка переменных
+            prompt_text = (
+                prompt_template
+                .replace("{{hypothesis_text}}", hypothesis_text)
+                .replace("{{source_context}}", source_context)
+                .replace("{{user_comment}}", user_comment)
+            )
+
+            # 3. Создание шага оркестратора
+            step_id = create_orchestrator_step(
+                task_id=task_id,
+                step_number=1,
+                step_type_name="hypothesis_refinement",
+                input_data={
+                    "hypothesis_id": input_data.get("hypothesis_id"),
+                    "mode": "llm_refinement",
+                    "user_comment_length": len(user_comment),
+                    "verification_session_id": input_data.get("verification_session_id"),
+                }
+            )
+
+            # 4. Вызов LLM через ModelService
+            model_name = model_params.get("model_name")
+            if not model_name:
+                raise RuntimeError(f"Prompt '{REFINEMENT_PROMPT_NAME}' has no 'model_name' in params")
+            model = ModelService()
+            model_info = model.get_model_info(model_name)
+            n_ctx = model_info.get("n_ctx", 32768)
+            safe_params = {
+                k: v for k, v in model_params.items()
+                if k in [
+                    "temperature", "top_p", "top_k", "min_p", "max_tokens",
+                    "presence_penalty", "repetition_penalty", "stop", "chat_template_kwargs"
+                ]
+            }
+            messages_for_llm = [{"role": "user", "content": prompt_text}]
+            result = model.generate(
+                messages=messages_for_llm,
+                model_name=model_name,
+                **safe_params
+            )
+            if not result.get("success"):
+                raise RuntimeError(f"LLM generation failed: {result.get('error')}")
+            refined_text = (result.get("content") or result.get("response") or "").strip()
+            raw_response = result.get("raw_response") or refined_text
+            reasoning_text = result.get("reasoning_content") or result.get("reasoning")
+            metrics = result.get("metrics", {})
+            timings = metrics.get("timings", {})
+            usage = metrics.get("usage", {})
+
+            # 5. Сохранение метрик LLM
+            llm_metric_id = save_llm_metrics(
+                orchestrator_step_id=step_id,
+                prompt_id=prompt_id,
+                host="main-srv",
+                model=metrics.get("model", model_name),
+                param=safe_params,
+                cache_n=timings.get("cache_n", 0),
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
+                host_nctx=metrics.get("host_nctx", n_ctx),
+                prompt_ms=timings.get("prompt_ms", 0.0),
+                prompt_per_token_ms=timings.get("prompt_per_token_ms", 0.0),
+                prompt_per_second=timings.get("prompt_per_second", 0.0),
+                predicted_per_second=timings.get("predicted_per_second", 0.0),
+                resp_time=timings.get("predicted_ms", 0.0) / 1000,
+                net_latency=0.0,
+                full_time=0.0
+            )
+            # 6. Сохранение артефактов
+            save_llm_artifacts(
+                llm_metric_id=llm_metric_id,
+                orchestrator_step_id=step_id,
+                messages=messages_for_llm,
+                raw_response=raw_response,
+                final_params=safe_params
+            )
+            # 7. Сохранение рассуждений (если есть)
+            if reasoning_text and reasoning_text.strip():
+                save_reasoning(
+                    orchestrator_step_id=step_id,
+                    content=reasoning_text.strip(),
+                    content_type="reflection"
+                )
+
+        # ====================================================================
+        # 8. ВОЗВРАЩАЕМ РЕЗУЛЬТАТ ЧЕРЕЗ output_data
+        #    НЕ ОБНОВЛЯЕМ ГИПОТЕЗУ В БД - это делает консоль после подтверждения
+        # ====================================================================
         output_data = {
             "refined_text": refined_text,
-            "verification_action_id": verification_action_id,
-            "metadata_updated": bool(metadata_updates),
+            "original_text": hypothesis_text,
+            "metadata_updates": metadata_updates,
+            "llm_skipped": is_comment_empty,
+            "prompt_id": prompt_id,
+            "orchestrator_step_id": step_id,
         }
         complete_step_success(step_id, output_data, llm_metric_id=llm_metric_id)
         complete_task_success(task_id, output_data)
-        logger.info("Hypothesis refined successfully: task=%s", task_id[:8])
+        logger.info(
+            "Hypothesis refinement generated: task=%s (llm_skipped=%s)",
+            task_id[:8], is_comment_empty
+        )
+
     except Exception as exc:
         logger.exception("Error in compose_hypothesis_refinement (task=%s): %s", task_id[:8], exc)
         if step_id:

@@ -62,11 +62,14 @@ agent/
 │        ├── db_manager/          # Управление БД
 │        │   ├── __init__.py
 │        │   ├── db_manager.py    # Подключение к PostgreSQL (использует postgres_db_config.yaml)
+│        │   ├── qdrant_manager.py    # Менеджер векторной БД Qdrant (upsert, поиск, удаление)
+│        │   ├── qdrant_schema.py     # Схема payload для коллекции opora_db
 │        │   └── migrations/      # Миграции Postgres
 │        │       ├── __init__.py
 │        │       ├── pg_migration_manager.py         # Менеджер применения миграций БД
 │        │       ├── V001_initial.sql                # Начальная схема (основные таблицы агента)
-│        │       └── V002_verification.sql           # Подсистема верификации гипотез
+│        │       ├── V002_verification.sql           # Подсистема верификации гипотез
+│        │       └── V003_knowledge_graph.sql        # Подсистема псевдографа памяти (узлы, рёбра, ревизии, промпты)
 │        │
 │        ├── dialog_services/     # Управление жизненным циклом диалогов
 │        │   ├── __init__.py
@@ -82,7 +85,12 @@ agent/
 │        │   ├── memory_composer.py      # Выполнение задачи извлечения гипотез и присвоение доменов
 │        │   ├── topic_composer.py       # Классификация гипотез по темам
 │        │   ├── verification_service.py # Управление сессиями верификации гипотез
-│        │   └── verification_composer.py # Выполнение задач верификации гипотез
+│        │   ├── verification_composer.py # Выполнение задач верификации гипотез
+│        │   ├── graph_linker_composer.py   # Построение логических связей внутри темы (LLM)
+│        │   ├── graph_merge_composer.py    # LLM-разрешение слияний гипотез с узлами
+│        │   ├── graph_node_sync.py         # Синхронизация узлов графа с Qdrant
+│        │   ├── graph_route_composer.py    # Детерминированный роутинг и создание узлов
+│        │   └── graph_summarize_composer.py # Иерархическое построение саммари узлов (LLM)
 │        │
 │        ├── model_service/       # Абстракция доступа к LLM с роутингом
 │        │   ├── __init__.py
@@ -99,12 +107,12 @@ agent/
 │        │   ├── orchestrator.py         # Фоновый цикл: выбор и диспетчеризация задач
 │        │   └── response_composer.py    # Генерация финального ответа через ModelService
 │        │
-│        │
 │        ├── services/            # Вспомогательные сервисы
 │        │   ├── __init__.py
 │        │   ├── lifecycle_manager.py  # Глобальный менеджер жизненного цикла агента
 │        │   ├── service_metrics.py    # Обновление статусов задач/шагов, метрики
-│        │   └── tokens_counter.py     # Подсчёт токенов для моделей Qwen
+│        │   ├── tokens_counter.py     # Подсчёт токенов для моделей Qwen
+│        │   └── emb_service.py        # Сервис векторизации узлов графа (вызов emb-srv, создание задач, синхронизация с Qdrant)
 │        │
 │        └── session_services/    # Управление сессиями
 │            ├── __init__.py

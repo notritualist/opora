@@ -483,7 +483,11 @@ VALUES
     ('reasoning_vectorize',         'Векторизация цепочки рассуждений (reasoning / COT)'),
     ('prompts_vectorize', 'Векторизация промптов'),
     ('memory_extraction', 'Извлечение гипотез из закрытых диалогов'),
-    ('topic_classification', 'LLM-классификация draft-гипотез по справочнику memory.topics')
+    ('topic_classification', 'LLM-классификация draft-гипотез по справочнику memory.topics'),
+    ('graph_route_and_create', 'Детерминированный роутинг гипотез и создание уникальных узлов'),
+    ('graph_merge_resolve',    'LLM-разрешение слияний гипотез с узлами'),
+    ('graph_relation_linker',  'Фоновое построение логических связей внутри тем'),
+    ('graph_summarize',        'Фоновое сжатие описаний узлов')
 ON CONFLICT (type_name) DO NOTHING;
 
 
@@ -520,7 +524,16 @@ VALUES
     ('reasoning_vectorize',         'Векторизация цепочки рассуждений (reasoning / COT)', '1.1.0'),
     ('prompts_vectorize',           'Векторизация промпта', '1.1.0'),
     ('memory_extraction', 'Извлечение гипотез из закрытых диалогов', '1.1.0'),
-    ('topic_classification', 'Батчевая классификация гипотез и присвоение topic_id', '1.1.0')
+    ('topic_classification', 'Батчевая классификация гипотез и присвоение topic_id', '1.1.0'),
+    ('graph_route_load',       'Загрузка confirmed гипотез диалога', '1.3.0'),
+    ('graph_route_vectorize',  'Векторизация и поиск в Qdrant', '1.3.0'),
+    ('graph_route_create',     'Транзакция создания уникальных узлов', '1.3.0'),
+    ('graph_merge_llm',        'Вызов LLM с CoT для решения по слиянию', '1.3.0'),
+    ('graph_merge_tx',         'Транзакция применения решения LLM', '1.3.0'),
+    ('graph_linker_llm',       'LLM-анализ узлов темы для связей (CoT)', '1.3.0'),
+    ('graph_linker_tx',        'Транзакция создания рёбер', '1.3.0'),
+    ('graph_summarize_llm',    'LLM-сжатие описания узла', '1.3.0'),
+    ('graph_summarize_tx',     'Транзакция обновления description', '1.3.0')
 ON CONFLICT (step_name) DO NOTHING;
 
 
@@ -721,8 +734,8 @@ CREATE TABLE IF NOT EXISTS metrics.emb_internal (
     param JSONB,
     vector_dimension INTEGER,
     prompt_tokens INTEGER, --Количество токенов в промпте (входные данные)
-    out_time TIMESTAMPTZ,  -- время отправки запроса на emb-сервер
-    in_time TIMESTAMPTZ,   -- время получения ответа от emb-сервера
+    received_at TIMESTAMPTZ,  -- время отправки запроса на emb-сервер
+    sent_at TIMESTAMPTZ,   -- время получения ответа от emb-сервера
     full_time FLOAT, -- общее время генерации
     error_status BOOLEAN NOT NULL DEFAULT false,
     error_message TEXT,
@@ -744,8 +757,8 @@ COMMENT ON COLUMN metrics.emb_internal.model IS 'Название примене
 COMMENT ON COLUMN metrics.emb_internal.param IS 'Параметры генерации эмбеддинга в формате JSON (размерность, нормализация, pooling и др.)';
 COMMENT ON COLUMN metrics.emb_internal.vector_dimension IS 'Размерность полученного эмбеддинга (например 1024, 2560, 4096). Зависит от модели и настроек.';
 COMMENT ON COLUMN metrics.emb_internal.prompt_tokens IS 'Количество токенов в промпте (входные данные для векторизации)';
-COMMENT ON COLUMN metrics.emb_internal.out_time IS 'Время отправки запроса на emb-сервер (начало операции)';
-COMMENT ON COLUMN metrics.emb_internal.in_time IS 'Время получения ответа от emb-сервера (окончание операции)';
+COMMENT ON COLUMN metrics.emb_internal.received_at IS 'Время получения запроса emb-сервером (начало операции)';
+COMMENT ON COLUMN metrics.emb_internal.sent_at IS 'Время отправки ответа от emb-сервера (окончание операции)';
 COMMENT ON COLUMN metrics.emb_internal.full_time IS 'Общее время генерации эмбеддинга в секундах (разница между in_time и out_time)';
 COMMENT ON COLUMN metrics.emb_internal.error_status IS 'Флаг наличия ошибок при генерации: true - была ошибка, false - успешно';
 COMMENT ON COLUMN metrics.emb_internal.error_message IS 'Текстовое описание ошибки генерации (заполняется при error_status = true)';
@@ -974,12 +987,13 @@ INSERT INTO orchestrator.prompts (
     'Промпт экстракции гипотез из диалогов в долговременную память',
     'internal'::public.prompt_type,
     (SELECT id FROM orchestrator.prompt_destinations WHERE name = 'internal_logic'),
-    E'Ты — анализатор диалогов для базы знаний. Извлеки из этого разговора ВСЕ значимые факты, которые могут пригодиться для планирования дел, базы навыков, справочных данных, анализа, аналитики, знаний.\n\n' ||
+    E'Ты — анализатор диалогов для базы знаний. Извлеки из этого разговора ВСЕ значимые факты, которые могут пригодиться для планирования дел, базы навыков, справочных данных, анализа, аналитики, знаний.\n' ||
     E'ИЗВЛЕКАТЬ:\n' ||
     E'- Конкретные факты, планы, предпочтения, личные данные, события, ограничения, навыки, привычки.\n' ||
     E'- Внешний контекст: новости, статистику, мировые события, законы, экономические данные, полезные знания.\n' ||
-    E'- Суть рекомендаций и советов, которые даёт в том числе ассистент (не переписывай дословно пустые фразы, выдели конкретную суть).\n\n' ||
-    E'НЕ ИЗВЛЕКАТЬ: приветствия, прощания, общие фразы без смысла, риторику, неинформативные реплики и тому подобное.\n' ||
+    E'- Суть рекомендаций и советов, которые даёт в том числе ассистент (не переписывай дословно пустые фразы, выдели конкретную суть).\n' ||
+    E'- РАЗБИВАЙ КАЖДОЕ САМОСТОЯТЕЛЬНОЕ УТВЕРЖДЕНИЕ В ОТДЕЛЬНУЮ СОДЕРЖАТЕЛЬНУЮ ГИПОТЕЗУ ВКУЛЮЧАЮЩУЮ все необходимые знания.\n\n' ||
+    E'НЕ ИЗВЛЕКАТЬ: приветствия, прощания, общие фразы без смысла, неинформативные реплики и тому подобное.\n' ||
     E'Если в чанке сообщений значимых знаний нет — верни []\n\n' ||
     E'УКАЖИ ИСТОЧНИК ЗНАНИЯ (knowledge_source):\n' ||
     E'- "user" — факт сообщил пользователь.\n' ||
@@ -1473,8 +1487,9 @@ CREATE TABLE IF NOT EXISTS memory.hypotheses (
     -- Статус верификации
     status memory.hypothesis_status NOT NULL DEFAULT 'draft',
     -- Интеграция в граф памяти
-    graph_integrated BOOLEAN NOT NULL DEFAULT FALSE,
-    graph_integrated_at TIMESTAMPTZ,
+    graph_merge_status memory.graph_merge_status NOT NULL DEFAULT 'none',
+    graph_review_reason TEXT,
+    candidate_node_id UUID,
     -- Трассируемость через оркестратор
     orchestrator_step_id UUID REFERENCES orchestrator.orchestrator_steps(id) ON DELETE SET NULL,
     prompt_id UUID REFERENCES orchestrator.prompts(id) ON DELETE RESTRICT,
@@ -1492,6 +1507,9 @@ COMMENT ON COLUMN memory.hypotheses.dialogue_id IS 'ID диалога, из ко
 COMMENT ON COLUMN memory.hypotheses.source_message_ids IS 'Массив ID сообщений, из которых извлечена гипотеза';
 COMMENT ON COLUMN memory.hypotheses.graph_integrated IS 'Флаг интеграции гипотезы в граф знаний: FALSE = не обработана, TRUE = интегрирована';
 COMMENT ON COLUMN memory.hypotheses.graph_integrated_at IS 'Время интеграции гипотезы в граф знаний (заполняется при graph_integrated = TRUE)';
+COMMENT ON COLUMN memory.hypotheses.graph_merge_status IS 'Статус интеграции в граф (ENUM)';
+COMMENT ON COLUMN memory.hypotheses.graph_review_reason IS 'Причина отправки на ручной разбор';
+COMMENT ON COLUMN memory.hypotheses.candidate_node_id IS 'UUID узла-кандидата из Qdrant (передаётся из фазы роутинга)';
 COMMENT ON COLUMN memory.hypotheses.orchestrator_step_id IS 'Шаг оркестратора, в котором была извлечена гипотеза';
 COMMENT ON COLUMN memory.hypotheses.prompt_id IS 'Промпт экстракции из orchestrator.prompts';
 COMMENT ON COLUMN memory.hypotheses.knowledge_source IS 'Источник знания: user (пользователь), agent (ассистент), external (внешний контекст)';
@@ -1501,6 +1519,7 @@ CREATE INDEX idx_hypotheses_dialogue ON memory.hypotheses (dialogue_id);
 CREATE INDEX idx_hypotheses_domain ON memory.hypotheses (domain_code);
 CREATE INDEX idx_hypotheses_topic ON memory.hypotheses (topic_id);
 CREATE INDEX idx_hypotheses_step ON memory.hypotheses (orchestrator_step_id);
+CREATE INDEX idx_hypotheses_ graph_merge_status ON memory.hypotheses (graph_merge_status);
 CREATE INDEX idx_hypotheses_prompt ON memory.hypotheses (prompt_id);
 CREATE INDEX idx_hypotheses_confidence ON memory.hypotheses (confidence);
 CREATE INDEX idx_hypotheses_source_messages ON memory.hypotheses USING gin (source_message_ids);

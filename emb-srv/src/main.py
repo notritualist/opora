@@ -4,7 +4,7 @@ __version__ = "1.0.0"
 __description__ = "Главный модуль сервера эмбендингов"
 
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
 import yaml
 from pathlib import Path
@@ -69,9 +69,9 @@ app = FastAPI(
     redoc_url=None
 )
 
-def now_iso_local():
-    """Возвращает текущее локальное время в формате ISO 8601 с микросекундами."""
-    return datetime.now().isoformat(timespec='microseconds')
+def now_iso_utc():
+    """Возвращает текущее UTC время сервера в формате ISO 8601 с микросекундами."""
+    return datetime.now(timezone.utc).isoformat(timespec='microseconds')
 
 class EmbedRequest(BaseModel):
     """Модель входного запроса: содержит текст для векторизации."""
@@ -84,8 +84,8 @@ async def embed(req: EmbedRequest):
     Запросы ждут своей очереди — не отклоняются.
     duration_sec включает в себ яи время ожиданяи в очереди.
     """
-    received_iso = now_iso_local()
-    received_ts = time.time()
+    received_iso = now_iso_utc()
+    received_ts = time.time() 
     vector = None
     error = None
 
@@ -105,7 +105,7 @@ async def embed(req: EmbedRequest):
         error = str(e)
         vector = None
     finally:
-        sent_iso = now_iso_local()
+        sent_iso = now_iso_utc()
         duration = time.time() - received_ts
         return JSONResponse({
             "vector": vector,

@@ -11,6 +11,10 @@ main-srv/src/orchestrator/orchestrator_entry.py
 - verification_proposal: проверка наличия draft-гипотез и отправка NOTIFY в UI.
 - hypothesis_refinement: LLM-уточнение гипотезы по комментарию пользователя.
 - schedule_graph_update: обновление графа знаний из подтверждённой гипотезы.
+- schedule_graph_route_and_create: создаёт задачу детерминированного роутинга и создания узлов графа памяти.
+- schedule_graph_merge_resolve: создаёт задачу LLM-разрешения слияний графа памяти.
+- schedule_graph_relation_linker: создаёт задачу фонового построения связей между узлами графа памяти внутри тем.
+- schedule_graph_summarize: создаёт задачу фонового сжатия описаний узлов графа памяти.
 
 Архитектура:
 - Универсальная функция create_orchestrator_task() с валидацией task_type.
@@ -21,7 +25,7 @@ main-srv/src/orchestrator/orchestrator_entry.py
 - Агент-версия передаётся глобально через version.py.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __description__ = "Entry point for orchestrator"
 
 import logging
@@ -304,3 +308,23 @@ def schedule_topic_classification(priority: float = 0.4) -> str:
             task_id = str(cur.fetchone()[0])
             conn.commit()
             return task_id
+
+
+def schedule_graph_route_and_create(dialogue_id: Optional[str] = None, priority: float = 0.4) -> str:
+    """Создаёт задачу детерминированного роутинга и создания узлов графа памяти."""
+    return create_orchestrator_task("graph_route_and_create", {"dialogue_id": dialogue_id}, priority)
+
+
+def schedule_graph_merge_resolve(priority: float = 0.3, parent_task_id: Optional[str] = None) -> str:
+    """Создаёт задачу LLM-разрешения слияний графа памяти."""
+    return create_orchestrator_task("graph_merge_resolve", {"mode": "pipeline"}, priority, parent_task_id=parent_task_id)
+
+
+def schedule_graph_relation_linker(priority: float = 0.2, parent_task_id: Optional[str] = None) -> str:
+    """Создаёт задачу фонового построения связей между узлами графа памяти внутри тем."""
+    return create_orchestrator_task("graph_relation_linker", {"mode": "pipeline"}, priority, parent_task_id=parent_task_id)
+
+
+def schedule_graph_summarize(priority: float = 0.1, parent_task_id: Optional[str] = None) -> str:
+    """Создаёт задачу фонового сжатия описаний узлов графа памяти."""
+    return create_orchestrator_task("graph_summarize", {"mode": "pipeline"}, priority, parent_task_id=parent_task_id)

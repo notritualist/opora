@@ -17,7 +17,7 @@ main-srv/src/interfaces/console_interface.py
     При редактировании (e) создаёт задачу hypothesis_refinement и ожидает её завершения.
 """
 
-version = "1.2.0"
+version = "1.2.1"
 description = "Console interface for dialogue with an agent (owner mode)"
 
 import logging
@@ -82,6 +82,7 @@ def _print_html(html_text: str) -> None:
     """Выводит форматированный текст через prompt_toolkit."""
     print_formatted_text(HTML(html_text), style=VERIFICATION_STYLE)
 
+
 def _prompt_html(session: PromptSession, text: str) -> str:
     """Запрашивает ввод с HTML-подсветкой."""
     try:
@@ -118,6 +119,7 @@ def _get_current_console_user() -> str:
         logger.warning(f"Failed to determine OS username: {e}. Using 'console:unknown'")
         return "console:unknown"
 
+
 def _print_welcome(agent_version: str, console_user_id: str, actor_type: str):
     """Выводит приветственное сообщение в консоль."""
     print(f"\n{'='*85}")
@@ -125,6 +127,7 @@ def _print_welcome(agent_version: str, console_user_id: str, actor_type: str):
     print(f"👤  Mode: {actor_type} (access level) | User: {console_user_id}")
     print(f"💡  Enter = send, Alt+Enter = new line, exit/выход or Ctrl+D to quit")
     print(f"{'='*85}\n")
+
 
 def _print_status(message: str, is_success: bool):
     """Выводит цветное сообщение статуса в консоль."""
@@ -134,6 +137,7 @@ def _print_status(message: str, is_success: bool):
     symbol = "✓" if is_success else "✗"
     color = COLOR_GREEN if is_success else COLOR_RED
     print(f"{color}[{symbol}] {message}{COLOR_RESET}")
+
 
 def create_prompt_session(session_manager: SessionManager) -> PromptSession:
     """
@@ -169,6 +173,7 @@ def create_prompt_session(session_manager: SessionManager) -> PromptSession:
         multiline=True,
         enable_history_search=True,
     )
+
 
 def get_user_input(session: PromptSession) -> str:
     """
@@ -223,8 +228,9 @@ def _prompt_shutdown_reason_ui(prompt_session: PromptSession, lifecycle_mgr: Lif
         except PromptInterruptedException:
             continue
         except EOFError:
-            # Ctrl+D — пробрасываем для выхода
-            raise
+             # Пользователь нажал Ctrl+D — используем значение по умолчанию
+            print_formatted_text(HTML('\n<warning>Interrupted. Using default: crash</warning>'))
+            return 'crash'
         except KeyboardInterrupt:
             print_formatted_text(HTML('\n<warning>Interrupted. Using default: crash</warning>'))
             return 'crash'
@@ -332,15 +338,15 @@ def run_verification_mode(
                 _show_source_context(db_config, source_ids)
                 continue
             elif action == 'y':
-                record_action(db_config, session_id, hyp_id, 'confirmed')
+                record_action(db_config, session_id, hyp_id, 'confirmed', actor_id=actor_id)
                 _print_html("<success>  ✅ Подтверждено</success>")
                 action_taken = True
             elif action == 'n':
-                record_action(db_config, session_id, hyp_id, 'rejected')
+                record_action(db_config, session_id, hyp_id, 'rejected', actor_id=actor_id)
                 _print_html("<error>  ❌ Отклонено</error>")
                 action_taken = True
             elif action == 's':
-                record_action(db_config, session_id, hyp_id, 'skipped')
+                record_action(db_config, session_id, hyp_id, 'skipped', actor_id=actor_id)
                 _print_html("<context>  ⏭ Пропущено</context>")
                 action_taken = True
             elif action == 'e':
@@ -383,6 +389,7 @@ def run_verification_mode(
             }
         )
 
+
 def _show_source_context(db_config: dict, source_message_ids: list) -> None:
     """
     Показывает ТОЛЬКО сообщения-источники гипотезы (без контекстного окна).
@@ -403,19 +410,19 @@ def _show_source_context(db_config: dict, source_message_ids: list) -> None:
         _print_html(f"<highlight>  ▶ [{role}] {content}</highlight>")
     _print_html("<context>  ── Конец источников ──</context>\n")
 
+
 def _handle_edit_mode(db_config: dict, session_id: str, hypothesis: dict, actor_id: str, prompt_session: PromptSession) -> None:
     hyp_id = str(hypothesis['id'])
     hyp_text = hypothesis['hypothesis_text']
     source_ids = hypothesis.get('source_message_ids') or []
-    
     _print_html("\n<action>✏️  Режим редактирования</action>")
     _show_source_context(db_config, source_ids)
-    
+
     # === 1. ЗАПРОС МЕТАДАННЫХ ===
     new_domain, new_source, new_topic_id, new_topic_name, metadata_changed = _prompt_metadata_edit(
         db_config, hypothesis, prompt_session
     )
-    
+
     # === 2. ЗАПРОС КОММЕНТАРИЯ К ТЕКСТУ ===
     _print_html("<action>  Введите комментарий/исправление текста (пустая строка для пропуска):</action>")
     comment_lines = []
@@ -425,11 +432,11 @@ def _handle_edit_mode(db_config: dict, session_id: str, hypothesis: dict, actor_
             break
         comment_lines.append(line)
     user_comment = "\n".join(comment_lines).strip()
-    
+
     if not user_comment and not metadata_changed:
         _print_html("<warning>  Никаких изменений не внесено.</warning>")
         return
-    
+
     # === 3. Формируем metadata_updates для композера ===
     metadata_updates = {}
     if metadata_changed:
@@ -438,75 +445,122 @@ def _handle_edit_mode(db_config: dict, session_id: str, hypothesis: dict, actor_
             'knowledge_source': new_source,
             'topic_id': new_topic_id,
         }
+
+    # === РАННИЙ ВЫХОД: пустой комментарий — только метаданные ===
+    if not user_comment:
+        if metadata_updates:
+            with psycopg2.connect(**db_config) as conn:
+                with conn.cursor() as cur:
+                    uf, up = [], []
+                    if 'domain_code' in metadata_updates:
+                        uf.append("domain_code = %s"); up.append(metadata_updates['domain_code'])
+                    if 'knowledge_source' in metadata_updates:
+                        uf.append("knowledge_source = %s"); up.append(metadata_updates['knowledge_source'])
+                    if 'topic_id' in metadata_updates:
+                        uf.append("topic_id = %s::uuid"); up.append(metadata_updates['topic_id'])
+                    if uf:
+                        up.append(hyp_id)
+                        cur.execute(f"UPDATE memory.hypotheses SET {', '.join(uf)}, updated_at = NOW() WHERE id = %s::uuid", up)
+                    meta_note = f"[metadata: {', '.join(f'{k}={v}' for k, v in metadata_updates.items())}]"
+                    cur.execute("""
+                        INSERT INTO memory.verification_actions (
+                            session_id, hypothesis_id, action_type,
+                            original_text, updated_text, user_comment
+                        ) VALUES (%s::uuid, %s::uuid, 'edited'::memory.verification_action_type, %s, %s, %s)
+                    """, (session_id, hyp_id, hyp_text, hyp_text, meta_note))
+                    cur.execute("UPDATE memory.verification_sessions SET hypotheses_edited = hypotheses_edited + 1 WHERE id = %s::uuid", (session_id,))
+                    conn.commit()
+            _print_html(f"<context>  📋 Метаданные обновлены: домен={new_domain}, источник={new_source}, тема={new_topic_name}</context>")
+            _print_html("<success>  ✅ Изменения применены (только метаданные)</success>")
+        return
     
-    # === 4. ЗАПУСК ЗАДАЧИ (композер сделает всё атомарно) ===
+    # === 4. ЗАПУСК ЗАДАЧИ (композер ТОЛЬКО генерирует текст, НЕ меняет БД) ===
     _print_html("<action>  ⚙️ Генерация уточнённой версии через LLM...</action>")
     try:
         task_id = schedule_hypothesis_refinement(
             hypothesis_id=hyp_id,
-            user_comment=user_comment or "[metadata update only]",
+            user_comment=user_comment,  # ← БЕЗ заглушки, передаём как есть
             verification_session_id=session_id,
             metadata_updates=metadata_updates,
         )
-        refined_text = _wait_for_refinement_result(db_config, task_id, timeout=120)
-        if not refined_text:
+        
+        # Ждём результат - получаем ВЕСЬ output_data
+        output_data = _wait_for_refinement_result(db_config, task_id, timeout=120)
+        
+        if not output_data or not output_data.get('refined_text'):
             _print_html("<error>  ⚠ Не удалось получить уточнённую гипотезу.</error>")
             return
         
-        # === 5. ПОДТВЕРЖДЕНИЕ РЕЗУЛЬТАТА ===
-        _print_html(f"\n<success>  📝 Уточнённая гипотеза:</success>")
-        _print_html(f"<hypothesis>  {refined_text}</hypothesis>")
-        if metadata_changed:
-            _print_html(f"<context>  📋 Метаданные обновлены: домен={new_domain}, источник={new_source}, тема={new_topic_name}</context>")
-        
-        accept_raw = _prompt_html(prompt_session, "\n<action>Принять изменения? [Y] да / [N] откатить: </action>")
-        accept = (accept_raw or "").strip().lower()
-        
-        if accept in ('y', 'yes', 'д', 'да'):
-            # Увеличиваем счётчик сессии
-            with psycopg2.connect(**db_config) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE memory.verification_sessions
-                        SET hypotheses_edited = hypotheses_edited + 1
-                        WHERE id = %s::uuid
-                    """, (session_id,))
-                    conn.commit()
-            _print_html("<success>  ✅ Изменения применены</success>")
-        else:
-            # Откат: восстанавливаем старый текст и метаданные
-            with psycopg2.connect(**db_config) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE memory.hypotheses
-                        SET hypothesis_text = %s,
-                            status = 'draft'::memory.hypothesis_status,
-                            domain_code = %s,
-                            knowledge_source = %s,
-                            topic_id = %s::uuid,
-                            updated_at = NOW()
-                        WHERE id = %s::uuid
-                    """, (
-                        hyp_text,
-                        hypothesis.get('domain_code'),
-                        hypothesis.get('knowledge_source'),
-                        hypothesis.get('topic_id'),
-                        hyp_id
-                    ))
-                    cur.execute("""
-                        UPDATE memory.verification_actions
-                        SET action_type = 'skipped'::memory.verification_action_type
-                        WHERE hypothesis_id = %s::uuid AND session_id = %s::uuid
-                        ORDER BY created_at DESC LIMIT 1
-                    """, (hyp_id, session_id))
-                    conn.commit()
-            _print_html("<context>  ⏪ Изменения откатаны</context>")
-    
+        refined_text = output_data['refined_text']
+        original_text = output_data.get('original_text', hyp_text)
+        prompt_id = output_data.get('prompt_id')
+        step_id = output_data.get('orchestrator_step_id')
+
+        # === 5. ПОДТВЕРЖДЕНИЕ С ВОЗМОЖНОСТЬЮ РУЧНОЙ ПРАВКИ ===
+        current_text = refined_text
+
+        while True:
+            _print_html(f"\n<success>  📝 Уточнённая гипотеза:</success>")
+            _print_html(f"<hypothesis>  {current_text}</hypothesis>")
+            if metadata_changed:
+                _print_html(f"<context>  📋 Метаданные обновлены: домен={new_domain}, источник={new_source}, тема={new_topic_name}</context>")
+
+            action_raw = _prompt_html(
+                prompt_session,
+                "\n<action>Действие: [Y] принять / [E] редактировать / [N] откатить: </action>"
+            )
+            action = (action_raw or "").strip().lower()
+
+            if action in ('e', 'edit', 'р', 'редактировать'):
+                _print_html("<action>  ✏️  Введите исправленный текст:</action>")
+                edit_lines = []
+                while True:
+                    line = _prompt_html(prompt_session, "  <context>> </context>")
+                    if not line and not edit_lines:
+                        _print_html("<warning>  Редактирование отменено</warning>")
+                        break
+                    if not line or not line.strip():
+                        break
+                    edit_lines.append(line)
+                if edit_lines:
+                    current_text = "\n".join(edit_lines).strip()
+                continue
+
+            if action in ('y', 'yes', 'д', 'да'):
+                final_comment = user_comment or ""
+                if metadata_updates:
+                    meta_note = f"[metadata: {', '.join(f'{k}={v}' for k, v in metadata_updates.items())}]"
+                    final_comment = f"{final_comment} {meta_note}".strip()
+                
+                record_action(
+                    db_config=db_config,
+                    session_id=session_id,
+                    hypothesis_id=hyp_id,
+                    action_type='edited',
+                    actor_id=actor_id,
+                    original_text=original_text,
+                    updated_text=current_text,
+                    user_comment=final_comment,
+                    orchestrator_step_id=step_id,
+                    prompt_id=prompt_id,
+                    metadata_updates=metadata_updates,
+                )
+                _print_html("<success>  ✅ Изменения применены</success>")
+                break
+
+            if action in ('n', 'no', 'н', 'нет'):
+                _print_html("<context>  ⏪ Изменения отклонены, гипотеза не изменена</context>")
+                break
+
+            _print_html("<error>  Неизвестная команда. Используйте Y/E/N.</error>")
+
     except Exception as e:
         logger.error("Edit mode error: %s", e, exc_info=True)
         _print_html(f"<error>  ❌ Ошибка: {e}</error>")
 
-def _wait_for_refinement_result(db_config: dict, task_id: str, timeout: int = 120) -> str | None:
+
+def _wait_for_refinement_result(db_config: dict, task_id: str, timeout: int = 120) -> dict | None:
+    """Возвращает весь output_data задачи, а не только refined_text."""
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -514,10 +568,11 @@ def _wait_for_refinement_result(db_config: dict, task_id: str, timeout: int = 12
                 with conn.cursor() as cur:
                     cur.execute("SELECT status, output_data FROM orchestrator.orchestrator_tasks WHERE id = %s", (task_id,))
                     row = cur.fetchone()
-                    if not row: return None
+                    if not row: 
+                        return None
                     status, output = row
                     if status == 'completed' and output:
-                        return output.get('refined_text')
+                        return output  # ← Возвращаем весь output_data
                     if status in ('failed', 'cancelled'):
                         return None
         except Exception:
@@ -545,6 +600,7 @@ def _print_verification_summary(db_config: dict, session_id: str) -> None:
     _print_html(f"<action>  ✏️ Изм.:    {s.get('hypotheses_edited', 0)}</action>")
     _print_html(f"<context>  ⏭ Пропущ.: {s.get('hypotheses_skipped', 0)}</context>")
     _print_html(f"<header>{'─'*40}</header>\n")
+
 
 def _prompt_metadata_edit(db_config: dict, hyp: dict, prompt_session: PromptSession) -> tuple:
     """

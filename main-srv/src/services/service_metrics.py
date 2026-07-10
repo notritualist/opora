@@ -371,6 +371,7 @@ def save_llm_metrics(
     logger.debug("LLM metrics saved: %s (step: %s)", metric_id[:8], orchestrator_step_id[:8])
     return metric_id
 
+
 def save_reasoning(
     orchestrator_step_id: str,
     content: str,
@@ -503,11 +504,12 @@ def save_emb_metrics(
     param: Dict[str, Any],
     vector_dimension: int,
     prompt_tokens: int,
-    out_time: Optional[datetime],
-    in_time: Optional[datetime],
+    received_at: Optional[datetime],
+    sent_at: Optional[datetime],
     full_time: float,
     error_status: bool,
-    error_message: Optional[str] = None
+    error_message: Optional[str] = None,
+    agent_version: str = "unknown"
 ) -> str:
     """
     Сохраняет метрики эмбеддинга в metrics.emb_internal.
@@ -519,11 +521,12 @@ def save_emb_metrics(
         param: Параметры векторизации (JSONB)
         vector_dimension: Размерность полученного вектора
         prompt_tokens: Количество токенов в тексте
-        out_time: Время отправки запроса
-        in_time: Время получения ответа
+        received_at: Время получения запроса
+        sent_at: Время отправки ответа
         full_time: Общее время генерации (сек)
         error_status: Флаг ошибки
         error_message: Текст ошибки (если была)
+        agent_version: Глобальная версия агента
         
     Returns:
         str: UUID записи метрики
@@ -536,7 +539,7 @@ def save_emb_metrics(
                 INSERT INTO metrics.emb_internal (
                     orchestrator_step_id, host, model, param,
                     vector_dimension, prompt_tokens,
-                    out_time, in_time, full_time,
+                    received_at, sent_at, full_time,
                     error_status, error_message, error_time,
                     agent_version, timestamp
                 ) VALUES (
@@ -546,7 +549,7 @@ def save_emb_metrics(
             """, (
                 orchestrator_step_id, host, model, Json(param),
                 vector_dimension, prompt_tokens,
-                out_time, in_time, full_time,
+                received_at, sent_at, full_time,
                 error_status, error_message,
                 datetime.now(timezone.utc) if error_status else None,
                 agent_version
