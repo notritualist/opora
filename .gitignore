@@ -38,6 +38,7 @@ Thumbs.db
 # LLM models
 **/models/*
 !**/models/.gitkeep
+keys/*
 
 # Data bases
 data_bases/
