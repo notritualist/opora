@@ -1,20 +1,27 @@
 """
 main-srv/src/memory_service/hypothesis_service.py
 
-Единый модуль работы с гипотезами долговременной памяти.
+Единый модуль работы с гипотезами долговременной памяти (CRUD и предобработка).
 
-Обязанности:
-- Константы лимитов токенов и настроек
-- CRUD гипотез и журнала обработанных сообщений
-- Форматирование сообщений в текст для LLM
-- Чанкинг по токенам (защита от переполнения контекста)
-- Парсинг JSON-ответа экстрактора с валидацией полей:
-  * knowledge_source (user/agent/external) — источник знания
-
-  Интеграция: через orchestrator_tasks → orchestrator_steps → llm_metrics → hypotheses.
+Основные возможности:
+1. Выборка и фильтрация:
+   - Получение необработанных сообщений из закрытых диалогов.
+   - Выборка гипотез для классификации (по темам и формам).
+2. Подготовка контекста для LLM:
+   - Форматирование сообщений с таймштампами (якорь времени для относительных дат).
+   - Чанкинг по токенам (защита от переполнения контекста, MAX_CHUNK_TOKENS).
+3. Парсинг ответов LLM (5 уровней защиты):
+   - Очистка markdown-обёрток.
+   - Fallback на regex-извлечение JSON-массива.
+   - Валидация структуры и confidence (отсечение < MIN_CONFIDENCE_THRESHOLD).
+   - Восстановление обрезанных/искаженных UUID (source_message_ids) по префиксу.
+   - Валидация knowledge_source (user/agent/external).
+4. Сохранение и обновление:
+   - Insert гипотез с привязкой к шагам оркестратора.
+   - Обновление статусов, topic_id, form_code при классификации.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __description__ = "Unified module for handling long-term memory hypotheses"
 
 
@@ -36,18 +43,23 @@ logger = logging.getLogger(__name__)
 EXTRACTION_PROMPT_NAME: str = "memory_hypothesis_extractor"
 
 # Максимум токенов на один чанк (защита от переполнения контекста)
-MAX_CHUNK_TOKENS: int = 32768
+MAX_CHUNK_TOKENS: int = 10000
 
 # Максимум сообщений, выбираемых за один цикл анализа
-MAX_MESSAGES_PER_BATCH: int = 30
+MAX_MESSAGES_PER_BATCH: int = 10
 
 # Минимальный confidence для сохранения гипотезы
 MIN_CONFIDENCE_THRESHOLD: float = 0.3
 
 # Константы обработки топиков гипотез
 TOPIC_CLASSIFICATION_PROMPT_NAME: str = "hypothesis_topic_classifier"
-MAX_TOPIC_BATCH_TOKENS: int = 32768 # Лимит токенов на батч классификации
-MAX_TOPICS_PER_BATCH: int = 30      # Максимум гипотез в одном батче
+MAX_TOPIC_BATCH_TOKENS: int = 10000 # Лимит токенов на батч классификации
+MAX_TOPICS_PER_BATCH: int = 10      # Максимум гипотез в одном батче
+
+# === Константы для классификации форм ===
+FORM_CLASSIFICATION_PROMPT_NAME: str = "hypothesis_form_classifier"
+MAX_FORM_BATCH_TOKENS: int = 10000
+MAX_FORMS_PER_BATCH: int = 10
 
 # =============================================================================
 # === РЕПОЗИТОРИЙ: CRUD и выборки ===
@@ -324,29 +336,99 @@ def get_topic_classification_prompt(db_config: dict) -> Optional[Dict[str, Any]]
             """, (TOPIC_CLASSIFICATION_PROMPT_NAME,))
             row = cur.fetchone()
             return dict(row) if row else None
-        
+
+
+def get_hypotheses_without_form(db_config: dict, limit: int = 100) -> List[Dict[str, Any]]:
+    """Возвращает гипотезы со статусом 'draft'/'needs_clarification' и form_code IS NULL."""
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, hypothesis_text, domain_code, knowledge_source
+                FROM memory.hypotheses
+                WHERE status IN ('draft'::memory.hypothesis_status, 'needs_clarification'::memory.hypothesis_status)
+                AND form_code IS NULL
+                ORDER BY created_at ASC
+                LIMIT %s
+            """, (limit,))
+            return [dict(row) for row in cur.fetchall()]
+
+
+def get_all_forms(db_config: dict) -> List[Dict[str, str]]:
+    """Возвращает весь справочник форм с описаниями для промпта."""
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT code, name, description 
+                FROM memory.forms 
+                WHERE is_active = TRUE 
+                ORDER BY code
+            """)
+            return [dict(row) for row in cur.fetchall()]
+
+
+def get_form_classification_prompt(db_config: dict) -> Optional[Dict[str, Any]]:
+    """Возвращает активный промпт классификатора форм."""
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, text, params FROM orchestrator.prompts
+                WHERE name = %s AND status IN ('testing'::prompt_status, 'active'::prompt_status)
+                ORDER BY created_at DESC LIMIT 1
+            """, (FORM_CLASSIFICATION_PROMPT_NAME,))
+            row = cur.fetchone()
+            return dict(row) if row else None      
+
+
+def assign_forms_to_hypotheses(db_config: dict, assignments: List[Dict[str, Optional[str]]]) -> int:
+    """
+    Обновляет form_code у гипотез.
+    assignments: [{ "hypothesis_id": "...", "form_code": "..." или None}, ...]
+    """
+    if not assignments:
+        return 0
+    updated = 0
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor() as cur:
+            for a in assignments:
+                hyp_id = a.get('hypothesis_id')
+                form_code = a.get('form_code')
+                if not hyp_id:
+                    continue
+                cur.execute("""
+                    UPDATE memory.hypotheses
+                    SET form_code = %s,
+                        updated_at = NOW()
+                    WHERE id = %s::uuid
+                """, (form_code, hyp_id))
+                updated += cur.rowcount
+            conn.commit()
+    return updated
+
 
 # =============================================================================
 # === ФОРМАТИРОВАНИЕ И ЧАНКИНГ ===
 # =============================================================================
 def format_messages_text(messages: List[Dict[str, Any]]) -> str:
     """
-    Форматирует сообщения в читаемый текст для LLM.
-    Учитывает и user, и system (агент) сообщения.
-    UUID показываем ПОЛНОСТЬЮ — модель должна вернуть их в source_message_ids.
-    
-    Формат:
-    [user <full-uuid>]: текст
-    [system]: текст
+    Форматирует сообщения с таймштампами для LLM-экстрактора.
+    Формат: [YYYY-MM-DD HH:MM] (uuid) (role): текст
+    Таймштампы нужны, чтобы LLM понимала относительные даты (завтра/вчера)
+    относительно момента произнесения реплики, а не текущего серверного времени.
     """
     lines = []
     for msg in messages:
-        role = msg['actor_type']  # 'user', 'owner', 'system'
+        role = msg['actor_type']
         msg_id = str(msg['id'])
         text = (msg.get('row_text') or "").strip()
         if not text:
             continue
-        lines.append(f"[{msg_id}] ({role}): {text}")
+        # Извлекаем timestamp сообщения (datetime из dialogs.row_messages)
+        ts = msg.get('timestamp')
+        if ts and hasattr(ts, 'strftime'):
+            dt_str = ts.strftime("%Y-%m-%d %H:%M")
+        else:
+            dt_str = "unknown"
+        lines.append(f"[{dt_str}] [{msg_id}] ({role}): {text}")
     return "\n".join(lines)
 
 
@@ -409,15 +491,25 @@ def build_extraction_user_prompt(
     chunk_messages: List[Dict[str, Any]]
 ) -> Tuple[str, List[str]]:
     """
-    Формирует user-промт для LLM с чанком сообщений.
-    
-    Returns: (текст промпта, список ID сообщений в чанке)
+    Формирует user-промт с якорем времени.
+    Якорь — дата завершения фрагмента — даёт LLM точку отсчёта
+    для относительных дат («завтра», «через 3 дня»).
     """
     text = format_messages_text(chunk_messages)
     message_ids = [str(m['id']) for m in chunk_messages]
     
+    # Якорь: timestamp последнего сообщения в чанке
+    last_ts = chunk_messages[-1].get('timestamp') if chunk_messages else None
+    if last_ts and hasattr(last_ts, 'strftime'):
+        anchor_str = last_ts.strftime("%Y-%m-%d %H:%M")
+    else:
+        anchor_str = "unknown"
+    
     user_prompt = (
-        f"Проанализируй следующий фрагмент диалога и извлеки все значимые знания.\n\n"
+        f"Проанализируй следующий фрагмент диалога и извлеки все значимые знания.\n"
+        f"ВАЖНО: Фрагмент завершён {anchor_str}. Все относительные даты "
+        f"(«завтра», «вчера», «через неделю», «на следующей неделе») считай "
+        f"относительно ЭТОЙ даты, а не текущего момента.\n\n"
         f"--- ФРАГМЕНТ ДИАЛОГА ({len(chunk_messages)} сообщений) ---\n"
         f"{text}\n"
         f"--- КОНЕЦ ФРАГМЕНТА ---\n\n"

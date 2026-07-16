@@ -1,26 +1,27 @@
 """
 main-srv/src/model_service/providers/base.py
 
-Абстрактный базовый класс для всех провайдеров LLM.
-Определяет единый контракт, который должны реализовывать все провайдеры.
-"""
+Абстрактный базовый класс (контракт) для всех LLM-провайдеров.
 
-__version__ = "1.1.0"
-__description__ = "Abstract base class for LLM providers"
+Определяет единый интерфейс и структуру возврата данных:
+1. generate():
+   - Принимает унифицированный набор параметров (temperature, top_p, max_tokens и т.д.).
+   - Поддерживает **extra_params для провайдер-специфичных функций:
+     - enable_search (bool): включение веб-поиска (например, для DashScope).
+     - enable_thinking (bool): включение режима рассуждения (CoT).
+   - Возвращает стандартизированный dict: {success, response, reasoning_content, metrics, error}.
+2. is_available(): Проверка доступности эндпоинта провайдера.
+3. get_model_info(): Возврат характеристик модели (n_ctx, max_tokens, поддержка reasoning/search/thinking).
+4. close(): Корректное освобождение ресурсов провайдера.
+"""
+version = "1.2.0"
+description = "Abstract base class for LLM providers"
 
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List
 
+
 class LLMProvider(ABC):
-    """
-    Базовый интерфейс провайдера LLM.
-    
-    Все провайдеры должны:
-    - Принимать одинаковый набор параметров генерации
-    - Возвращать унифицированный формат ответа
-    - Самостоятельно обрабатывать ошибки и повторы
-    """
-    
     @abstractmethod
     def generate(
         self,
@@ -33,68 +34,47 @@ class LLMProvider(ABC):
         presence_penalty: float,
         stop: List[str],
         model_name: str,
-        **extra_params
+        **extra_params,
     ) -> Dict[str, Any]:
         """
         Генерация ответа модели.
         
-        Все параметры обязательные — передаются из промпта.
-        
         Args:
-            messages: список сообщений в формате OpenAI
-            temperature, top_p, top_k, min_p, max_tokens, presence_penalty, stop: параметры генерации
-            model_name: имя модели (для внутреннего роутинга провайдера)
-            **extra_params: дополнительные параметры (например, chat_template_kwargs)
-            
-        Returns:
-            dict: Унифицированный формат ответа:
-                {
-                    "success": bool,
-                    "response": str,              # чистый ответ (content)
-                    "reasoning_content": str,     # рассуждение (отдельное поле), может быть пустым
-                    "metrics": {
-                        "usage": {...},           # prompt_tokens, completion_tokens, total_tokens
-                        "timings": {...},         # prompt_ms, predicted_per_second, etc.
-                        "model": str,             # фактически использованная модель
-                        "id": str,                # ID запроса
-                        "host_nctx": int          # n_ctx модели
-                    },
-                    "error": str                  # пусто при успехе
-                }
-        """
-        pass
-    
-    @abstractmethod
-    def is_available(self) -> bool:
-        """
-        Проверка доступности провайдера.
+            **extra_params: дополнительные параметры, в т.ч.:
+                - enable_search (bool): включить веб-поиск (только для провайдеров, 
+                  которые его поддерживают — DashScope)
+                - enable_thinking (bool): включить режим рассуждения (thinking-модели)
+                - chat_template_kwargs и любые другие
         
         Returns:
-            bool: True если провайдер готов к работе
-        """
-        pass
-    
-    @abstractmethod
-    def get_model_info(self, model_name: str) -> Dict[str, Any]:
-        """
-        Возвращает информацию о возможностях модели.
-        
-        Args:
-            model_name: имя модели
-            
-        Returns:
-            dict: {
-                "n_ctx": int,
-                "supports_reasoning": bool,
-                "max_tokens": int,
-                ...
+            Унифицированный dict:
+            {
+                "success": bool,
+                "response": str,
+                "reasoning_content": str,
+                "metrics": {"usage": {...}, "timings": {...}, "model": str, ...},
+                "error": str,
             }
         """
         pass
 
     @abstractmethod
+    def is_available(self) -> bool:
+        pass
+
+    @abstractmethod
+    def get_model_info(self, model_name: str) -> Dict[str, Any]:
+        """
+        Возвращает возможности модели.
+        Fields:
+            - n_ctx: int
+            - max_tokens: int
+            - supports_reasoning: bool
+            - enable_search: bool (поддерживает ли модель веб-поиск)
+            - enable_thinking: bool (поддерживает ли модель thinking-режим)
+        """
+        pass
+
+    @abstractmethod
     def close(self) -> None:
-        """
-        Корректное закрытие ресурсов провайдера (HTTP-соединения, файлы и т.д.).
-        """
         pass

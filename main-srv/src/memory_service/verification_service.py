@@ -1,23 +1,26 @@
 """
 main-srv/src/memory_service/verification_service.py
 
-Модуль управления сессиями и действиями верификации гипотез.
+Сервис управления сессиями и действиями верификации гипотез (Human-in-the-Loop).
 
-Обязанности:
-- Получение draft-гипотез с пагинацией и сортировкой.
-- Управление сессиями верификации (создание, завершение, отложение).
-- Запись действий пользователя (confirm / reject / edit / skip) в memory.verification_actions.
-- Обновление статусов гипотез в memory.hypotheses.
-- Получение контекста источников (сообщений диалога) для отображения в CLI.
-- Проверка возможности предложения верификации (с учётом deferred_until).
-- Закрытие задач оркестратора verification_proposal после ответа пользователя.
-
-Интеграция:
-Используется консольным интерфейсом (console_interface.py) для интерактивного разбора.
-Связывает memory.hypotheses с memory.verification_sessions и orchestrator.orchestrator_steps.
+Основные возможности:
+1. Получение данных:
+   - Выборка draft-гипотез (needs_clarification) с пагинацией.
+   - Извлечение контекста источников (сообщений диалога) с окном контекста (ordinal-based).
+2. Управление сессиями:
+   - Создание active-сессий (блокирует спам от оркестратора).
+   - Завершение (completed) или отложение (deferred_until) сессий.
+   - Проверка возможности предложения верификации (can_propose_verification).
+3. Запись действий (record_action):
+   - Фиксация выбора пользователя (confirm/reject/edit/skip).
+   - Атомарное обновление статуса гипотезы и её метаданных (domain, source, topic).
+   - Обновление счетчиков в сессии верификации.
+4. Интеграция с оркестратором:
+   - Корректное закрытие задач verification_proposal после ответа пользователя.
+   - Очистка "зависших" (dangling) сессий при рестарте агента.
 """
 
-version = "1.1.1"
+version = "1.2.0"
 description = "Hypothesis verification session management"
 
 import logging
@@ -41,8 +44,8 @@ def get_unverified_hypotheses(db_config: dict, limit: int = 50, offset: int = 0)
             cur.execute("""
                 SELECT h.id, h.hypothesis_text, h.source_message_ids, h.domain_code,
                        h.topic_id, t.name AS topic_name, h.knowledge_source, 
-                       h.confidence, h.status, h.created_at,
-                       h.dialogue_id  -- НОВОЕ
+                       h.confidence, h.status, h.created_at, h.form_code,
+                       h.dialogue_id
                 FROM memory.hypotheses h
                 LEFT JOIN memory.topics t ON t.id = h.topic_id
                 WHERE h.status = 'needs_clarification'::memory.hypothesis_status
