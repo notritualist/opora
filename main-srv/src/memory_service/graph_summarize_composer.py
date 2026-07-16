@@ -1,20 +1,24 @@
 """
 main-srv/src/memory_service/graph_summarize_composer.py
-Композер задачи graph_summarize.
-Иерархическое построение саммари узлов графа (CoT).
-Последовательность шагов оркестратора:
-graph_route_load     — выборка узлов, требующих обновления саммари
-graph_summarize_llm  — сборка иерархического контекста, вызов LLM (graph_node_summarizer) с CoT
-graph_summarize_tx   — транзакция обновления summary
+
+Композер оркестратора для задачи graph_summarize.
+Иерархическое построение и обновление саммари узлов графа с использованием LLM (CoT).
+
+Последовательность шагов:
+1. graph_route_load: Выборка узлов, требующих обновления саммари (сортировка bottom-up).
+2. graph_summarize_llm: Сборка иерархического контекста, вызов LLM (prompt: graph_node_summarizer).
+3. graph_summarize_tx: Транзакция обновления summary и confidence узла.
+
 Архитектура и правила:
-- enable_thinking: true. Рассуждения сохраняются.
-- Контекст включает целевой узел + входящие подузлы/зависимости (refines, depends_on, contains, related_to).
-- Саммари строится снизу вверх, интегрируя смыслы зависимых узлов.
-- Поддерживает расширение/уточнение смысла, не теряет критичные детали.
-- Метрики, артефакты, трассировка.
+- Bottom-up обход: узлы сортируются по in_degree ASC (сначала листы/зависимости, потом корни).
+- Контекст включает целевой узел + входящие подузлы/зависимости 
+  (рёбра: refines, depends_on, contains, related_to).
+- Отсекает пустые/короткие саммари дочерних узлов (< 15 символов) для экономии токенов.
+- Лимит контекста: MAX_CONTEXT_TOKENS = 10000.
+- Триггер пайплайна: при успешном обновлении запускает entity_clustering.
 """
 
-version = "1.1.0"
+version = "1.2.0"
 description = "Graph summarizer: hierarchical summary builder from child/dependent nodes (CoT)"
 
 import json
@@ -31,7 +35,7 @@ from services.service_metrics import (
     save_llm_artifacts, save_reasoning, set_step_llm_metric_id, set_step_reasoning_id
 )
 from services.tokens_counter import count_tokens_qwen
-from version import __version__ as agent_version
+from services.datetime_context import build_time_block
 
 logger = logging.getLogger(__name__)
 PROMPT_NAME = "graph_node_summarizer"
@@ -42,9 +46,14 @@ def compose_graph_summarize(task_id: str, input_data: Dict[str, Any]) -> None:
     db_config = load_postgres_config()
     step_sel = create_orchestrator_step(task_id, 1, "graph_route_load", {})
     nodes = _select_nodes(step_sel, db_config)
+    
     if not nodes:
+        complete_step_success(step_sel, {"loaded": 0})  # Завершаем шаг
         return complete_task_success(task_id, output_data={"processed": 0})
     
+    # Завершаем шаг с количеством загруженных узлов
+    complete_step_success(step_sel, {"loaded": len(nodes)}) 
+
     processed = 0
     for idx, n in enumerate(nodes):
         # ИСПРАВЛЕНО: динамические номера шагов для каждого узла
@@ -66,6 +75,15 @@ def compose_graph_summarize(task_id: str, input_data: Dict[str, Any]) -> None:
             processed += 1
     complete_task_success(task_id, output_data={"processed": processed})
 
+    # === ТРИГГЕР СЛЕДУЮЩЕГО ШАГА: entity_clustering ===
+    if processed > 0:
+        try:
+            from orchestrator.orchestrator_entry import schedule_entity_clustering
+            schedule_entity_clustering(priority=0.15, parent_task_id=task_id)
+            logger.info("Pipeline → entity_clustering (after summarize, processed=%d)", processed)
+        except Exception as e:
+            logger.error("Post-summarize entity_clustering trigger failed: %s", e)
+
 
 def _select_nodes(step_id: str, db_config: dict) -> List[dict]:
     """Выбирает узлы, требующие саммари. Сортировка in_degree ASC гарантирует bottom-up обход."""
@@ -78,10 +96,10 @@ def _select_nodes(step_id: str, db_config: dict) -> List[dict]:
                         FROM memory.graph_nodes n
                         LEFT JOIN memory.graph_edges e ON e.target_node_id = n.id AND e.is_active = TRUE
                         WHERE n.is_active = TRUE
-                          AND (n.summary IS NULL OR length(n.summary) < 50 OR n.needs_summary_update = TRUE)
+                          AND (n.summary IS NULL OR n.needs_summary_update = TRUE)
                         GROUP BY n.id
                     )
-                    SELECT n.id, n.summary, n.description, n.context_date, nd.in_degree
+                    SELECT n.id, n.summary, n.description, n.context_date, nd.in_degree, n.form_code
                     FROM memory.graph_nodes n
                     JOIN node_degrees nd ON nd.id = n.id
                     ORDER BY nd.in_degree ASC, n.updated_at ASC
@@ -98,7 +116,7 @@ def _build_hierarchical_context(node: dict, db_config: dict) -> tuple:
         with psycopg2.connect(**db_config) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT gn.id, gn.summary, ge.relation_type
+                    SELECT gn.id, gn.summary, gn.form_code, ge.relation_type
                     FROM memory.graph_edges ge
                     JOIN memory.graph_nodes gn ON gn.id = ge.source_node_id
                     WHERE ge.target_node_id = %s AND ge.is_active 
@@ -109,7 +127,10 @@ def _build_hierarchical_context(node: dict, db_config: dict) -> tuple:
                 
                 # ФИКС: отсекаем пустые/короткие саммари, чтобы не жечь токены на мусор
                 valid_children = [
-                    {"id": str(c["id"]), "summary": c["summary"], "relation_type": c["relation_type"]}
+                    {"id": str(c["id"]), 
+                    "form": c.get("form_code") or "unknown",
+                    "summary": c["summary"], 
+                    "relation_type": c["relation_type"]}
                     for c in children
                     if c["summary"] and len(c["summary"].strip()) > 15
                 ]
@@ -117,7 +138,8 @@ def _build_hierarchical_context(node: dict, db_config: dict) -> tuple:
                 children_json = json.dumps(valid_children, ensure_ascii=False)
                 
                 ctx = (
-                    f'[ЦЕЛЕВОЙ УЗЕЛ] id:{node["id"]}, current_summary:"{node["summary"] or ""}", description:"{node["description"] or ""}"\n'
+                    f'[ЦЕЛЕВОЙ УЗЕЛ] id:{node["id"]}, form:{node.get("form_code") or "unknown"}, '
+                    f'current_summary:"{node["summary"] or ""}", description:"{node["description"] or ""}"\n'
                     f'[ВХОДЯЩИЕ ПОДУЗЛЫ/ЗАВИСИМОСТИ] {children_json}'
                 )
                 return ctx, valid_children
@@ -138,7 +160,9 @@ def _call_llm(step_id: str, ctx: str, db_config: dict) -> Optional[Dict[str, Any
         # ИСПРАВЛЕНО: извлекаем model_name отдельно
         model_name = params.pop("model_name", "Qwen3.5-9B-Q4_K_M.gguf")
         
-        msgs = [{"role": "system", "content": p["text"]}, {"role": "user", "content": ctx}]
+        # Добавляем время и дату
+        system_with_time = p["text"] + build_time_block("summarize")
+        msgs = [{"role": "system", "content": system_with_time}, {"role": "user", "content": ctx}]
         model = ModelService()
         info = model.get_model_info(model_name)
         n_ctx = info.get("n_ctx", 32768)
@@ -177,15 +201,15 @@ def _update_summary(step_id: str, n_id: str, raw: str, db_config: dict):
     """Парсит JSON, валидирует confidence и обновляет summary узла."""
     try:
         c = raw.strip()
-        if c.startswith("```"):
+        if c.startswith("`"):
             s, e = c.find('{'), c.rfind('}')
-            if s!=-1 and e!=-1: c = c[s:e+1]
+            if s != -1 and e != -1:
+                c = c[s:e + 1]
         d = json.loads(c)
         if not isinstance(d, dict) or "summary" not in d:
             raise ValueError("Missing summary key")
-            
-        new_summ = d["summary"][:500]
         
+        new_summ = d["summary"][:500]
         conf = d.get("confidence", 0.9)
         if not isinstance(conf, (int, float)) or not (0.0 <= conf <= 1.0):
             conf = 0.9
@@ -197,11 +221,12 @@ def _update_summary(step_id: str, n_id: str, raw: str, db_config: dict):
                     UPDATE memory.graph_nodes 
                     SET summary=%s, 
                         confidence = GREATEST(confidence, %s),
-                        needs_summary_update = FALSE,  -- <<< ФИКС: сброс флага после обработки
+                        needs_summary_update = FALSE,
                         updated_at=NOW() 
                     WHERE id=%s
                 """, (new_summ, conf, n_id))
                 conn.commit()
+        
         complete_step_success(step_id, {"summary_len": len(new_summ), "applied_confidence": conf})
     except Exception as e:
         complete_step_error(step_id, "graph_summarize_composer", str(e))

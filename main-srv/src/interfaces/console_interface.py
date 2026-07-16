@@ -1,23 +1,36 @@
 """
 main-srv/src/interfaces/console_interface.py
 
-Консольный интерфейс для диалога с агентом.
-Возможности:
-- Многострочный ввод (Shift+Enter = новая строка, Enter = отправить)
-- Ctrl+N = Новый диалог (разрыв контекста, rotate_dialogue)
-- Ctrl+D = Корректный выход
-- Автоматическая привязка пользователя ОС к актору (owner/user)
-- Управление сессиями через SessionManager
-- Интеграция с жизненным циклом: старт/завершение с фиксацией actor_id
+Консольный интерфейс (CLI) для интерактивного диалога с агентом в режиме владельца (owner).
 
-- Режим верификации гипотез:
-    Фоновый поток слушает PostgreSQL канал 'verification_channel' (LISTEN/NOTIFY).
-    При получении события от оркестратора (наличие draft-гипотез в режиме sleep) прерывает стандартный цикл и предлагает пользователю верификацию.
-    Поддерживает действия: подтвердить (y), отклонить (n), редактировать (e), контекст (c), пропустить (s), отложить (d).
-    При редактировании (e) создаёт задачу hypothesis_refinement и ожидает её завершения.
+Основные возможности:
+1. Управление вводом (prompt_toolkit):
+   - Enter: отправить сообщение.
+   - Alt+Enter (или Shift+Enter): перенос строки.
+   - Ctrl+N: разрыв контекста (rotate_dialogue), начало нового диалога.
+   - Ctrl+D: корректный выход из приложения.
+   - Ctrl+C: игнорируется (защита от случайного выхода).
+
+2. Управление жизненным циклом и сессиями:
+   - Автоматическая привязка пользователя ОС (console:username) к актору в БД.
+   - Обработка "зависших" состояний (dangling state): при старте проверяет, был ли агент в active/sleep, 
+     и через UI запрашивает причину предыдущего завершения (shutdown_type).
+   - Интеграция с LifecycleManager и SessionManager.
+
+3. Фоновый режим верификации гипотез (LISTEN/NOTIFY):
+   - Отдельный поток слушает PostgreSQL канал 'verification_channel'.
+   - При получении события от оркестратора (наличие draft-гипотез) прерывает блокирующий prompt 
+     через кастомное исключение PromptInterruptedException.
+   - Предлагает пользователю интерактивную верификацию:
+     [Y] подтвердить, [N] отклонить, [E] редактировать, [C] контекст, [S] пропустить, [Q] выход.
+   - Режим [E] позволяет менять метаданные (домен, тема, форма) и запускать LLM-уточнение текста 
+     (hypothesis_refinement) с последующим ручным подтверждением.
+
+4. Обработка shutdown:
+   - При выходе (Ctrl+D, exit) запрашивает причину завершения и корректно закрывает сессии и лайфцикл.
 """
 
-version = "1.2.1"
+version = "1.3.0"
 description = "Console interface for dialogue with an agent (owner mode)"
 
 import logging
@@ -314,6 +327,7 @@ def run_verification_mode(
         confidence = hyp.get('confidence', 0.0)
         domain_code = hyp.get('domain_code', 'unknown')
         topic_name = hyp.get('topic_name') or (str(hyp.get('topic_id', ''))[:8] if hyp.get('topic_id') else 'Без темы')
+        form_code = hyp.get('form_code') or 'unknown'
         knowledge_source = hyp.get('knowledge_source', 'unknown')
         source_ids = hyp.get('source_message_ids') or []
         _print_html(
@@ -321,6 +335,7 @@ def run_verification_mode(
             f"\n<context>  📊 Уверенность: {confidence:.0%}</context>"
             f"\n<context>  🏷️ Домен: {domain_code} | Источник: {knowledge_source}</context>"
             f"\n<context>  📚 Тема: {topic_name}</context>"
+            f"\n<context>  🧩 Форма: {form_code}</context>"
             f"\n<context>  🆔 ID: {hyp_id[:8]}</context>"
             f"\n<hypothesis>  📌 {hyp_text}</hypothesis>"
         )
@@ -419,7 +434,7 @@ def _handle_edit_mode(db_config: dict, session_id: str, hypothesis: dict, actor_
     _show_source_context(db_config, source_ids)
 
     # === 1. ЗАПРОС МЕТАДАННЫХ ===
-    new_domain, new_source, new_topic_id, new_topic_name, metadata_changed = _prompt_metadata_edit(
+    new_domain, new_source, new_topic_id, new_topic_name, new_form_code, metadata_changed = _prompt_metadata_edit(
         db_config, hypothesis, prompt_session
     )
 
@@ -444,6 +459,7 @@ def _handle_edit_mode(db_config: dict, session_id: str, hypothesis: dict, actor_
             'domain_code': new_domain,
             'knowledge_source': new_source,
             'topic_id': new_topic_id,
+            'form_code': new_form_code,  # ← НОВОЕ
         }
 
     # === РАННИЙ ВЫХОД: пустой комментарий — только метаданные ===
@@ -458,10 +474,22 @@ def _handle_edit_mode(db_config: dict, session_id: str, hypothesis: dict, actor_
                         uf.append("knowledge_source = %s"); up.append(metadata_updates['knowledge_source'])
                     if 'topic_id' in metadata_updates:
                         uf.append("topic_id = %s::uuid"); up.append(metadata_updates['topic_id'])
+                    if 'form_code' in metadata_updates:
+                        uf.append("form_code = %s"); up.append(metadata_updates['form_code'])
                     if uf:
                         up.append(hyp_id)
                         cur.execute(f"UPDATE memory.hypotheses SET {', '.join(uf)}, updated_at = NOW() WHERE id = %s::uuid", up)
                     meta_note = f"[metadata: {', '.join(f'{k}={v}' for k, v in metadata_updates.items())}]"
+                    
+                    # ✅ Добавляем обновление статуса
+                    cur.execute("""
+                        UPDATE memory.hypotheses
+                        SET status = 'confirmed'::memory.hypothesis_status,
+                            verified_at = NOW(),
+                            verified_by_actor_id = %s::uuid
+                        WHERE id = %s::uuid
+                    """, (actor_id, hyp_id))
+
                     cur.execute("""
                         INSERT INTO memory.verification_actions (
                             session_id, hypothesis_id, action_type,
@@ -503,7 +531,7 @@ def _handle_edit_mode(db_config: dict, session_id: str, hypothesis: dict, actor_
             _print_html(f"\n<success>  📝 Уточнённая гипотеза:</success>")
             _print_html(f"<hypothesis>  {current_text}</hypothesis>")
             if metadata_changed:
-                _print_html(f"<context>  📋 Метаданные обновлены: домен={new_domain}, источник={new_source}, тема={new_topic_name}</context>")
+                _print_html(f"<context>  📋 Метаданные обновлены: домен={new_domain}, источник={new_source}, тема={new_topic_name}, форма={new_form_code}</context>")
 
             action_raw = _prompt_html(
                 prompt_session,
@@ -610,7 +638,8 @@ def _prompt_metadata_edit(db_config: dict, hyp: dict, prompt_session: PromptSess
     current_domain = hyp.get('domain_code', 'unknown')
     current_source = hyp.get('knowledge_source', 'unknown')
     current_topic_id = hyp.get('topic_id')
-    current_topic_name = hyp.get('topic_name') or 'Без темы'
+    current_topic_name = hyp.get('topic_name') or 'unknown'
+    current_form = hyp.get('form_code') or 'unknown'
     
     _print_html("\n<action>📋 Редактирование метаданных (Enter = оставить текущее)</action>")
     
@@ -635,7 +664,13 @@ def _prompt_metadata_edit(db_config: dict, hyp: dict, prompt_session: PromptSess
         prompt_session,
         f"<context>  📖 Тема (текущая: {current_topic_name}): </context>"
     ).strip()
-    
+
+    # Форма
+    new_form_raw = _prompt_html(
+        prompt_session,
+        f"<context>  🧩 Форма (текущая: {current_form}) [fact/goal/task/project/entity/skill/event]: </context>"
+    ).strip().lower()
+
     new_topic_id = current_topic_id
     topic_changed = False
     if new_topic_name:
@@ -664,15 +699,30 @@ def _prompt_metadata_edit(db_config: dict, hyp: dict, prompt_session: PromptSess
                 _print_html(f"<error>  ⚠ Ошибка работы с темой: {e}</error>")
                 new_topic_id = current_topic_id
     
+    new_form_code = current_form
+    form_changed = False
+    if new_form_raw in ('без формы', 'none', '-', ''):
+        if new_form_raw == '-' and current_form != 'unknown':
+            new_form_code = None
+            form_changed = True
+        # else — Enter (пустая строка), оставляем текущее
+    elif new_form_raw in ('fact', 'goal', 'task', 'project', 'entity', 'skill', 'event'):
+        if new_form_raw != current_form:
+            new_form_code = new_form_raw
+            form_changed = True
+    elif new_form_raw:
+        _print_html(f"<warning>  Неизвестная форма '{new_form_raw}', оставляем текущую</warning>")
+
     changed = (
         new_domain != current_domain or
         new_source != current_source or
-        topic_changed
+        topic_changed or
+        form_changed
     )
     
     # Возвращаем имя темы для красивого вывода в UI
-    display_topic_name = new_topic_name if new_topic_name else 'Без темы'
-    return new_domain, new_source, new_topic_id, display_topic_name, changed
+    display_topic_name = new_topic_name if new_topic_name else 'unknown'
+    return new_domain, new_source, new_topic_id, display_topic_name, new_form_code, changed
 
 # =============================================================================
 # === ГЛАВНАЯ ТОЧКА ВХОДА ====================================================

@@ -1,19 +1,22 @@
 """
 main-srv/src/memory_service/graph_node_sync.py
 
-Сервис синхронизации узлов графа с Qdrant после изменения описаний.
-Вызывается ПОСЛЕ успешного COMMIT транзакции в композерах.
-Логика:
-1. Чтение актуального description, actor_id, topic_id, qdrant_point_id из БД
-2. Векторизация через emb-srv
-3. Upsert в Qdrant (обновление существующей точки или создание новой)
-4. Обновление qdrant_point_id в memory.graph_nodes
-Архитектура:
-- Не блокирует основные транзакции.
-- При ошибке векторизации/Qdrant → лог WARNING, узел остаётся в БД с устаревшим вектором.
-- Следующий успешный sync перезапишет точку.
+Сервис post-commit синхронизации узлов графа с векторной БД Qdrant.
+Вызывается композерами (merge, summarize) ПОСЛЕ успешного COMMIT транзакции в PostgreSQL.
+
+Логика работы:
+1. Чтение актуальных данных узла (description, actor_id, topic_id, domain_id, qdrant_point_id) из БД.
+2. Векторизация description через внешний emb-srv.
+3. Upsert вектора в Qdrant (обновление существующей точки или создание новой).
+4. Обновление qdrant_point_id в memory.graph_nodes (если он изменился).
+
+Архитектурные принципы:
+- Не блокирует основные транзакции БД (вызывается после commit).
+- Fail-safe: при ошибке векторизации или Qdrant логирует WARNING. 
+  Узел остается в БД, а следующая успешная синхронизация перезапишет точку.
 """
-version = "1.1.0"
+
+version = "1.2.0"
 description = "Post-commit sync service for graph nodes → Qdrant"
 
 import logging
@@ -59,14 +62,6 @@ def sync_node_to_qdrant(node_id: str, db_config: Optional[Dict[str, Any]] = None
                     logger.warning("Sync skipped: node %s has empty description", node_id[:8])
                     return False
 
-                # Проверка наличия обязательных маршрутизирующих ID
-                domain_id_val = row["domain_id"]
-                topic_id_val = row["topic_id"]
-                
-                if not domain_id_val or not topic_id_val:
-                    logger.warning("Sync skipped: node %s missing domain_id or topic_id", node_id[:8])
-                    return False
-                    
                 # Векторизация
                 vec, resp = call_emb_server(desc)
                 if not vec:
@@ -77,12 +72,10 @@ def sync_node_to_qdrant(node_id: str, db_config: Optional[Dict[str, Any]] = None
                 qdrant_id = upsert_graph_node_vector(
                     vector=vec,
                     postgres_node_id=node_id,
-                    domain_id=str(domain_id_val),
-                    topic_id=str(topic_id_val),
                     actor_id=str(row["actor_id"]) if row["actor_id"] else None,
                     qdrant_point_id=row["qdrant_point_id"]
                 )
-                
+                    
                 # Обновление ссылки в БД
                 if qdrant_id != row["qdrant_point_id"]:
                     cur.execute("UPDATE memory.graph_nodes SET qdrant_point_id=%s WHERE id=%s", (qdrant_id, node_id))
