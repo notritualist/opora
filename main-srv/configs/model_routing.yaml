@@ -1,66 +1,362 @@
 # main-srv/configs/model_routing.yaml
+# Прямой маппинг: имя_модели → {provider, параметры}
+# Работает по точному совпадению model_name (никаких паттернов!)
 
-# === Правила роутинга: модель → провайдер ===
 routing:
-  rules:
-    # Локальные GGUF-модели
-    - pattern: "*.gguf"
-      provider: "local_llama"
-      priority: 100
-    
-    # Qwen через DashScope (если включено)
-    - pattern: "qwen-plus"
-      provider: "dashscope"
-      priority: 90
-      enabled: false  # по умолчанию отключено
-    
-    - pattern: "qwen-max"
-      provider: "dashscope"
-      enabled: false
-    
-    # Fallback: всё остальное → локальный провайдер
-    - pattern: "*"
-      provider: "local_llama"
-      priority: 1
+  models:
+    # ============================================================
+    # === Qwen 3.7 (флагманы 2026) ===
+    # ============================================================
+    qwen3.7-max:
+      provider: dashscope
+      n_ctx: 262144
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: false
 
-# === Конфигурация провайдеров ===
+    qwen3.7-max-thinking:
+      provider: dashscope
+      n_ctx: 262144
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    qwen3.7-plus:
+      provider: dashscope
+      n_ctx: 1048576
+      max_tokens: 32768
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: false
+
+    # ============================================================
+    # === Qwen 3.6 ===
+    # ============================================================
+    qwen3.6-max-preview:
+      provider: dashscope
+      n_ctx: 262144
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: false
+
+    qwen3.6-plus:
+      provider: dashscope
+      n_ctx: 1048576
+      max_tokens: 32768
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: false
+
+    qwen3.6-27b:
+      provider: dashscope
+      n_ctx: 262144
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    qwen3.6-flash:
+      provider: dashscope
+      n_ctx: 262144
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: false
+
+    # ============================================================
+    # === Qwen 3.5 ===
+    # ============================================================
+    qwen3.5-27b:
+      provider: dashscope
+      n_ctx: 262144
+      max_tokens: 32768
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: false
+
+    qwen3.5-9b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 32768
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: false
+
+    qwen3.5-omni-plus:
+      provider: dashscope
+      n_ctx: 65536
+      max_tokens: 32768
+      supports_reasoning: true
+      enable_search: false   # Omni не поддерживает search
+      enable_thinking: true
+
+    # ============================================================
+    # === Qwen 3 (Dense) ===
+    # ============================================================
+    qwen3-max:
+      provider: dashscope
+      n_ctx: 262144
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: false
+
+    qwen3-max-thinking:
+      provider: dashscope
+      n_ctx: 262144
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    qwen3-plus:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: false
+
+    qwen3-turbo:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 8192
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: false
+
+    qwen3-235b-a22b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    qwen3-30b-a3b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    qwen3-32b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    qwen3-14b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 8192
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    qwen3-8b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 8192
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    qwen3-4b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 8192
+      supports_reasoning: true
+      enable_search: false   # мелкие модели — search часто отключён
+      enable_thinking: false
+
+    qwen3-1.7b:
+      provider: dashscope
+      n_ctx: 32768
+      max_tokens: 8192
+      supports_reasoning: false
+      enable_search: false
+      enable_thinking: false
+
+    qwen3-0.6b:
+      provider: dashscope
+      n_ctx: 32768
+      max_tokens: 4096
+      supports_reasoning: false
+      enable_search: false
+      enable_thinking: false
+
+    # ============================================================
+    # === Qwen 3 VL (Vision-Language) ===
+    # ============================================================
+    qwen3-vl-plus:
+      provider: dashscope
+      n_ctx: 1048576
+      max_tokens: 32768
+      supports_reasoning: true
+      enable_search: false   # VL-модели не поддерживают search
+      enable_thinking: false
+
+    qwen3-vl-235b-a22b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: false
+      enable_thinking: true
+
+    qwen3-vl-32b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: false
+      enable_thinking: true
+
+    qwen3-vl-30b-a3b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: false
+      enable_thinking: true
+
+    qwen3-vl-8b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 8192
+      supports_reasoning: true
+      enable_search: false
+      enable_thinking: true
+
+    # ============================================================
+    # === Qwen 3 Coder ===
+    # ============================================================
+    qwen3-coder-next:
+      provider: dashscope
+      n_ctx: 262144
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    qwen3-coder-plus:
+      provider: dashscope
+      n_ctx: 1048576
+      max_tokens: 32768
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    qwen3-coder-flash:
+      provider: dashscope
+      n_ctx: 262144
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: false
+
+    qwen3-coder-30b-a3b:
+      provider: dashscope
+      n_ctx: 262144
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    qwen3-coder-480b-a35b:
+      provider: dashscope
+      n_ctx: 1048576
+      max_tokens: 32768
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    # ============================================================
+    # === QwQ (Reasoning) ===
+    # ============================================================
+    qwq-32b:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 16384
+      supports_reasoning: true
+      enable_search: true
+      enable_thinking: true
+
+    # ============================================================
+    # === Классические Qwen (Max / Plus / Turbo / Long) ===
+    # ============================================================
+    qwen-max:
+      provider: dashscope
+      n_ctx: 32768
+      max_tokens: 8192
+      supports_reasoning: false
+      enable_search: true
+      enable_thinking: false
+
+    qwen-plus:
+      provider: dashscope
+      n_ctx: 131072
+      max_tokens: 8192
+      supports_reasoning: false
+      enable_search: true
+      enable_thinking: false
+
+    qwen-turbo:
+      provider: dashscope
+      n_ctx: 1048576
+      max_tokens: 8192
+      supports_reasoning: false
+      enable_search: true
+      enable_thinking: false
+
+    qwen-long:
+      provider: dashscope
+      n_ctx: 1048576
+      max_tokens: 16384
+      supports_reasoning: false
+      enable_search: true
+      enable_thinking: false
+
+    # ============================================================
+    # === Локальные GGUF (через llama-server) ===
+    # ============================================================
+    Qwen3.5-9B-Q4_K_M.gguf:
+      provider: local_llama
+      n_ctx: 262144
+      max_tokens: 32768
+      supports_reasoning: true
+      enable_search: false   # локальные модели без поиска
+      enable_thinking: true
+
 providers:
   local_llama:
-    enabled: true
-    type: "llama_server"
+    type: llama_server
     base_url: "http://main-srv:8081/v1/chat/completions"
     timeout: 1200
     retry:
       max_attempts: 3
       backoff_seconds: 1.0
-    models:
-      Qwen3.5-9B-Q4_K_M.gguf:
-        path: "/mnt/work/kaya/main-srv/models/qwen3_5/Qwen3.5-9B-Q4_K_M.gguf"
-        n_ctx: 262144
-        supports_reasoning: true  # возвращает reasoning_content отдельно
 
   dashscope:
-    enabled: false
-    type: "openai_compatible"
+    type: openai_compatible
     base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
-    api_key_env: "DASHSCOPE_API_KEY"  # брать из env, не хранить в конфиге
-    timeout: 120
+    api_key_env: "DASHSCOPE_API_KEY"
+    timeout: 320
     retry:
       max_attempts: 2
       backoff_seconds: 0.5
-    models:
-      qwen-plus:
-        n_ctx: 32768
-        supports_reasoning: true
-      qwen-max:
-        n_ctx: 32768
-        supports_reasoning: true
 
-# === Глобальные настройки ===
 defaults:
   queue:
     enabled: false
     max_size: 10
   logging:
-    request_body: false  # не логировать тела запросов (безопасность)
+    request_body: false
     response_body: false

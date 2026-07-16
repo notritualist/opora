@@ -61,12 +61,7 @@ COMMENT ON COLUMN memory.verification_actions.original_text IS 'Исходный
 COMMENT ON COLUMN memory.verification_actions.updated_text IS 'Уточнённый текст гипотезы (после LLM)';
 COMMENT ON COLUMN memory.verification_actions.user_comment IS 'Комментарий пользователя при редактировании';
 
--- Блок 3: Настройки
-INSERT INTO state.settings (param_name, value_float, description) VALUES
-    ('verification_defer_minutes', 30.0, 'Минуты, на которые откладывается верификация при выборе "отложить"')
-ON CONFLICT (param_name) DO NOTHING;
-
--- Блок 4: Типы задач и шагов оркестратора
+-- Блок 3: Типы задач и шагов оркестратора
 INSERT INTO orchestrator.task_types (type_name, description) VALUES
     ('verification_proposal', 'Проверка необходимости и инициация предложения верификации'),
     ('hypothesis_refinement', 'LLM-уточнение гипотезы по комментарию пользователя')
@@ -77,7 +72,7 @@ INSERT INTO orchestrator.step_types (step_name, description, agent_version) VALU
     ('hypothesis_refinement', 'LLM-уточнение гипотезы на основе комментария', '1.2.0')
 ON CONFLICT (step_name) DO NOTHING;
 
--- Блок 5: Промпт для LLM-уточнения гипотез
+-- Блок 4: Промпт для LLM-уточнения гипотез
 DO $$
 DECLARE
     v_destination_id UUID;
@@ -100,7 +95,7 @@ BEGIN
             E'Тебе дана исходная гипотеза, извлечённая из диалога, контекст для понимания диалога и комментарий пользователя.\n' ||
             E'Твоя задача — переформулировать гипотезу с учётом комментария пользователя.\n\n' ||
             E'Задача:\n' ||
-            E'1. Исправь ошибки, на которые указал пользователь. Его исправления имеют наивысший приоритет.\n' ||
+            E'1. Исправь ошибки, на которые указал пользователь и дополни с учетом его замечаний.\n' ||
             E'2. Исправь орфографию и пунктуацию если необходимо.\n' ||
             E'3. Добавь уточнения, если они появились у пользователя.\n' ||
             E'4. Ошибочные элементы на которые указал пользователь удалять без оговорок (не пиши "информации об X нет" — просто убери X).\n' ||
@@ -116,11 +111,11 @@ BEGIN
             E'- Язык ответа: русский.\n</Правила>\n',
             '{
              "model_name": "Qwen3.5-9B-Q4_K_M.gguf",
-             "temperature": 0.8,
+             "temperature": 0.7,
              "top_p": 0.8,
              "top_k": 20,
              "min_p": 0.0,
-             "max_tokens": 32768,
+             "max_tokens": 15000,
              "presence_penalty": 0.0,
              "repetition_penalty": 1.0,
              "stop": ["<|im_end|>"],
@@ -132,7 +127,7 @@ BEGIN
 END $$;
 
 
--- Блок 6: Промпт для классификатора тем гипотез
+-- Блок 5: Промпт для классификатора тем гипотез
 DO $$
 DECLARE
     v_destination_id UUID;
@@ -174,17 +169,84 @@ BEGIN
             E'</Формат ответа>\n</Правила>\n',
             '{
               "model_name": "Qwen3.5-9B-Q4_K_M.gguf",
-              "temperature": 0.8,
+              "temperature": 0.7,
               "top_p": 0.8,
               "top_k": 20,
               "min_p": 0.0,
-              "max_tokens": 32768,
+              "max_tokens": 20000,
               "presence_penalty": 0.0,
               "repetition_penalty": 1.0,
               "stop": ["<|im_end|>"],
-              "chat_template_kwargs": {"enable_thinking": true}
+              "chat_template_kwargs": {"enable_thinking": false}
             }'::jsonb,
             '{}'::jsonb, 'testing'::public.prompt_status, v_creator_id, '1.3.0', now()
         );
     END IF;
+END $$;
+
+-- Блок 6: Промпт для классификатора forms гипотез
+DO $$
+DECLARE
+v_destination_id UUID;
+v_creator_id UUID;
+v_prompt_name TEXT := 'hypothesis_form_classifier';
+v_prompt_version TEXT := '1.1.0';
+BEGIN
+SELECT id INTO v_destination_id FROM orchestrator.prompt_destinations WHERE name = 'internal_logic' LIMIT 1;
+SELECT id INTO v_creator_id FROM users.actors WHERE type = 'owner' LIMIT 1;
+
+IF NOT EXISTS (SELECT 1 FROM orchestrator.prompts WHERE name = v_prompt_name AND version = v_prompt_version) THEN
+    INSERT INTO orchestrator.prompts (
+        version, name, description, type, destination_id, text, params,
+        prompt_effectiveness, status, created_by, agent_version, created_at
+    ) VALUES (
+        v_prompt_version, v_prompt_name,
+        'Классификатор гипотез по строгому справочнику форм сущностей. Возвращает JSON-маппинг ID гипотезы к code формы.',
+        'internal'::public.prompt_type, v_destination_id,
+        E'<Правила>\n' ||
+        E'Ты — модуль классификации формы (природы) фактов базы знаний агента.\n' ||
+        E'Тебе дан список гипотез (с их ID, текстом, доменом и источником) и СТРОГИЙ справочник форм сущностей.\n\n' ||
+        E'Твоя задача:\n' ||
+        E'1. Выбрать для гипотез НАИБОЛЕЕ релевантную форму из справочника.\n' ||
+        E'2. Форма описывает ПРИРОДУ факта: чем является гипотиза по своей сути (факт, цель, задача, проект, сущность, навык, событие), независимо от домена.\n' ||
+        E'3. Если гипотеза содержит рекомендацию, предложение, совет или план действий – это НЕ факт. Это либо цель (goal), либо задача (task), либо проект (project), в зависимости от наличия сроков и объёма. Факт – только констатация текущего состояния или свойства (например, "у меня есть", "составляет", "проживает").\n' ||
+        E'4. Назначай форму только при полной смысловой уверенности. Если есть сомнение — ставь null. Лучше пропустить, чем назначить неверно.\n' ||
+        E'5. ЗАПРЕЩЕНО выдумывать новые формы или изменять коды существующих. Используй ТОЧНЫЕ code из справочника.\n' ||
+        E'6. Указывай точные uuid гипотез!\n' ||
+        E'7. Ответ должен быть СТРОГО в формате JSON-массива без markdown-обёртки.\n' ||
+        E'<Примеры классификации>\n' ||
+        E'Пример 1:\n' ||
+        E'Гипотеза: "Подготовить отчёт по продажам к 18:00 сегодня"\n' ||
+        E'Форма: task (конкретное действие с дедлайном)\n' ||
+        E'Пример 2:\n' ||
+        E'Гипотеза: "Разобраться в тонкостях налогового законодательства"\n' ||
+        E'Форма: null (неопределённость – может быть goal, skill или task, явных признаков нет)\n' ||
+        E'</Примеры классификации>\n\n' ||
+        E'<Справочник форм>\n' ||
+        E'{forms_list}\n' ||
+        E'</Справочник форм>\n\n' ||
+        E'<Гипотезы для классификации>\n' ||
+        E'{hypotheses_list}\n' ||
+        E'</Гипотезы для классификации>\n\n' ||
+        E'<Формат ответа (строго JSON)>\n' ||
+        E'[\n' ||
+        E'  {"hypothesis_id": "uuid1...", "form_code": "форма"},\n' ||
+        E'  {"hypothesis_id": "uuid2...", "form_code": null}\n' ||
+        E']\n' ||
+        E'</Формат ответа>\n</Правила>\n',
+        '{
+          "model_name": "Qwen3.5-9B-Q4_K_M.gguf",
+          "temperature": 0.7,
+          "top_p": 0.8,
+          "top_k": 20,
+          "min_p": 0.0,
+          "max_tokens": 20000,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "stop": ["<|im_end|>"],
+          "chat_template_kwargs": {"enable_thinking": false}
+        }'::jsonb,
+        '{}'::jsonb, 'testing'::public.prompt_status, v_creator_id, '1.4.0', now()
+    );
+END IF;
 END $$;

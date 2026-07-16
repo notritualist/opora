@@ -5,82 +5,83 @@ agent/
 ├── .gitignore                   # Игнорируемые файлы
 ├── .gitmodules                  # Импортированные модули
 │
-├── emb-srv/                      # Сервер эмбеддингов
-│    ├── .venv/                   # Виртуальное окружение Python
+├── emb-srv/                     # Сервер эмбеддингов
+│    ├── .venv/                  # Виртуальное окружение Python
 │    ├── configs/
-│    │   ├── model_config.yaml    # Конфигурация параметров модели
-│    │   └── server_config.yaml   # Сетевые настройки сервера
+│    │   ├── model_config.yaml   # Конфигурация параметров модели
+│    │   └── server_config.yaml  # Сетевые настройки сервера
 │    │
-│    ├── models/                  # LLM модели (игнорируется git)
+│    ├── models/                 # LLM модели (игнорируется git)
 │    │   └── Qwen3-Embedding-4B-Q4_K_M.gguf
 │    │
 │    ├── src/
-│    │   └── main.py              # FastAPI приложение с эндпоинтом /embed
+│    │   └── main.py             # FastAPI приложение с эндпоинтом /embed
 │    │
 │    ├── systemd/
 │    │   └── embedding-server.service  # Systemd-юнит для автозапуска службы
 │    │
-│    └── requirements.txt         # Файл зависимостей .venv
+│    └── requirements.txt        # Файл зависимостей .venv
 │
 ├── main-srv/                    # Основной сервер
 │    ├── .venv/                  # Виртуальное окружение Python
 │    ├── configs/
-│    │   ├── docker-compose.yaml  # Docker Compose для PostgreSQL и Qdrant
-│    │   ├── postgresql.conf      # Конфигурация PostgreSQL
-│    │   ├── pg_hba.conf          # Правила аутентентификации PostgreSQL
-│    │   ├── qdrant_config.yaml   # Конфигурация Qdrant
+│    │   ├── docker-compose.yaml # Docker Compose для PostgreSQL и Qdrant
+│    │   ├── postgresql.conf     # Конфигурация PostgreSQL
+│    │   ├── pg_hba.conf         # Правила аутентификации PostgreSQL
+│    │   ├── qdrant_config.yaml  # Конфигурация Qdrant
 │    │   ├── postgres_db_config.yaml  # Конфигурация PostgreSQL (подключение к БД)
-│    │   ├── model_routing.yaml   # Конфигурация роутинга LLM моделей
-│    │   └── emb_srv_config.yaml  # Настройки доступа к серверу эмбеддингов
+│    │   ├── model_routing.yaml  # Конфигурация роутинга LLM моделей
+│    │   └── emb_srv_config.yaml # Настройки доступа к серверу эмбеддингов
 │    │
 │    ├── llama.cpp/              # Субмодуль llama.cpp (форк)
 │    │   ├── CMakeLists.txt
 │    │   ├── Makefile
-│    │   ├── build/               # Собранные бинарники (игнорируется git)
-│    │   └── ...                  # Исходники llama.cpp
+│    │   ├── build/              # Собранные бинарники (игнорируется git)
+│    │   └── ...                 # Исходники llama.cpp
 │    │
 │    ├── logs/                   # Логи работы агента
-│    │   └── opora_full.log        # Полный лог (DEBUG+)
+│    │   └── opora_full.log      # Полный лог (DEBUG+)
 │    │
 │    ├── models/                 # LLM модели (игнорируется git)
 │    │   ├── qwen3_5/
 │    │   │   └── Qwen3.5-9B-Q4_K_M.gguf
 │    │   └── qwen3_5-tokenizer/
-│    │       └── tokenizer.json   # Токенизатор для Qwen3.5
+│    │       └── tokenizer.json  # Токенизатор для Qwen3.5
 │    │
 │    ├── requirements.txt        # Файл зависимостей .venv
 │    │
 │    ├── scripts/
-│    │   ├── start-db.sh          # Скрипт запуска всех БД
+│    │   ├── start-db.sh         # Скрипт запуска всех БД
 │    │   └── start_llama-server.sh # Скрипт запуска llama-server с моделью Qwen3.5
 │    │
-│    └── src/                     # Исходный код Python
+│    └── src/                    # Исходный код Python
 │        ├── __init__.py
-│        ├── main.py              # Точка входа (запуск агента)
-│        ├── version.py           # Глобальная версия из pyproject.toml
+│        ├── main.py             # Точка входа (запуск агента)
+│        ├── version.py          # Глобальная версия из pyproject.toml
 │        │
-│        ├── db_manager/          # Управление БД
+│        ├── db_manager/         # Управление БД
 │        │   ├── __init__.py
-│        │   ├── db_manager.py    # Подключение к PostgreSQL (использует postgres_db_config.yaml)
-│        │   ├── qdrant_manager.py    # Менеджер векторной БД Qdrant (upsert, поиск, удаление)
-│        │   ├── qdrant_schema.py     # Схема payload для коллекции opora_db
-│        │   └── migrations/      # Миграции Postgres
+│        │   ├── db_manager.py   # Подключение к PostgreSQL (использует postgres_db_config.yaml)
+│        │   ├── qdrant_manager.py   # Менеджер векторной БД Qdrant (upsert, поиск, удаление)
+│        │   ├── qdrant_schema.py    # Схема payload для коллекции opora_db
+│        │   └── migrations/     # Миграции Postgres
 │        │       ├── __init__.py
-│        │       ├── pg_migration_manager.py         # Менеджер применения миграций БД
-│        │       ├── V001_initial.sql                # Начальная схема (основные таблицы агента)
-│        │       ├── V002_verification.sql           # Подсистема верификации гипотез
-│        │       └── V003_knowledge_graph.sql        # Подсистема псевдографа памяти (узлы, рёбра, ревизии, промпты)
+│        │       ├── pg_migration_manager.py   # Менеджер применения миграций БД
+│        │       ├── V001_initial.sql          # Начальная схема (основные таблицы агента)
+│        │       ├── V002_verification.sql     # Подсистема верификации гипотез
+│        │       ├── V003_knowledge_graph.sql  # Подсистема псевдографа памяти (узлы, рёбра, ревизии, промпты)
+│        │       └── V004_retrieval.sql        # Подсистема предобработки и поиска (retrieval logs, routing context)
 │        │
-│        ├── dialog_services/     # Управление жизненным циклом диалогов
+│        ├── dialog_services/    # Управление жизненным циклом диалогов
 │        │   ├── __init__.py
-│        │   └── dialogue_manager.py  # Менеджер диалогов (создание/закрытие, таймауты)
+│        │   └── dialogue_manager.py # Менеджер диалогов (создание/закрытие, таймауты)
 │        │
-│        ├── interfaces/          # Интерфейсы
+│        ├── interfaces/         # Интерфейсы
 │        │   ├── __init__.py
-│        │   └── console_interface.py  # Консольный UI
+│        │   └── console_interface.py # Консольный UI
 │        │
-│        ├── memory_service/      # Подсистема долговременной памяти агента
-│        │   ├── __init__.py
+│        ├── memory_service/     # Подсистема долговременной памяти агента
+│        │   ├── __init__.py 
 │        │   ├── hypothesis_service.py   # Единый модуль работы с гипотезами
 │        │   ├── memory_composer.py      # Выполнение задачи извлечения гипотез и присвоение доменов
 │        │   ├── topic_composer.py       # Классификация гипотез по темам
@@ -90,33 +91,44 @@ agent/
 │        │   ├── graph_merge_composer.py    # LLM-разрешение слияний гипотез с узлами
 │        │   ├── graph_node_sync.py         # Синхронизация узлов графа с Qdrant
 │        │   ├── graph_route_composer.py    # Детерминированный роутинг и создание узлов
-│        │   └── graph_summarize_composer.py # Иерархическое построение саммари узлов (LLM)
+│        │   ├── graph_summarize_composer.py # Иерархическое построение саммари узлов (LLM)
+│        │   ├── entity_binding_composer.py      # Инкрементальная привязка fact-узлов к entity-агрегаторам
+│        │   ├── entity_clustering_composer.py   # Батчевая кластеризация fact-узлов и создание entity-агрегаторов
+│        │   └── form_composer.py                # LLM-классификация гипотез по структурным формам
 │        │
-│        ├── model_service/       # Абстракция доступа к LLM с роутингом
+│        ├── model_service/      # Абстракция доступа к LLM с роутингом
 │        │   ├── __init__.py
-│        │   ├── model_service.py        # Роутер: выбор провайдера по model_name (использует model_routing.yaml)
-│        │   └── providers/              # Реализации провайдеров LLM
+│        │   ├── model_service.py    # Роутер: выбор провайдера по model_name (использует model_routing.yaml)
+│        │   └── providers/          # Реализации провайдеров LLM
 │        │       ├── __init__.py
-│        │       ├── base.py                 # Абстрактный интерфейс LLMProvider
-│        │       ├── local_llama.py          # Провайдер для локального llama-server
-│        │       └── external_dashscope.py   # Провайдер для DashScope API (заглушка)
+│        │       ├── base.py             # Абстрактный интерфейс LLMProvider
+│        │       ├── local_llama.py      # Провайдер для локального llama-server
+│        │       └── external_dashscope.py # Провайдер для DashScope API (заглушка)
 │        │
-│        ├── orchestrator/        # Ядро оркестрации задач
+│        ├── orchestrator/       # Ядро оркестрации задач
 │        │   ├── __init__.py
-│        │   ├── orchestrator_entry.py   # Точка входа: создание задач из внешних событий
-│        │   ├── orchestrator.py         # Фоновый цикл: выбор и диспетчеризация задач
-│        │   └── response_composer.py    # Генерация финального ответа через ModelService
+│        │   ├── orchestrator_entry.py # Точка входа: создание задач из внешних событий
+│        │   ├── orchestrator.py       # Фоновый цикл: выбор и диспетчеризация задач
+│        │   └── response_composer.py  # Генерация финального ответа через ModelService
 │        │
-│        ├── services/            # Вспомогательные сервисы
+│        ├── preprocessing/      # Подсистема предобработки запросов (пайплайн question_preprocessing)
 │        │   ├── __init__.py
-│        │   ├── lifecycle_manager.py  # Глобальный менеджер жизненного цикла агента
-│        │   ├── service_metrics.py    # Обновление статусов задач/шагов, метрики
-│        │   ├── tokens_counter.py     # Подсчёт токенов для моделей Qwen
-│        │   └── emb_service.py        # Сервис векторизации узлов графа (вызов emb-srv, создание задач, синхронизация с Qdrant)
+│        │   ├── pipeline.py             # Оркестратор этапа преданализа (routing, decomposition, retrieval)
+│        │   ├── routing_composer.py     # Шаг question_routing: LLM-предразбор для определения доменов
+│        │   ├── decomposition_composer.py # Шаг query_decomposition: LLM-разбиение сложного запроса на подвопросы
+│        │   └── retrieval_composer.py   # Шаг knowledge_retrieval: гибридный поиск и сборка контекста из графа
 │        │
-│        └── session_services/    # Управление сессиями
+│        ├── services/           # Вспомогательные сервисы
+│        │   ├── __init__.py
+│        │   ├── lifecycle_manager.py # Глобальный менеджер жизненного цикла агента
+│        │   ├── service_metrics.py   # Обновление статусов задач/шагов, метрики
+│        │   ├── tokens_counter.py    # Подсчёт токенов для моделей Qwen
+│        │   ├── emb_service.py       # Сервис векторизации узлов графа (вызов emb-srv, создание задач, синхронизация с Qdrant)
+│        │   └── datetime_context.py  # Формирование темпорального контекста (дата, время) для промптов LLM
+│        │
+│        └── session_services/   # Управление сессиями
 │            ├── __init__.py
-│            └── session_manager.py      # Менеджер сессий и привязки actor_id
+│            └── session_manager.py   # Менеджер сессий и привязки actor_id
 │
 └── docs/                        # Документация
     └── ...
