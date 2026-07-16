@@ -1,18 +1,35 @@
 """
 main-srv/src/services/service_metrics.py
 
-спомогательный модуль для обновления статусов и сохранения метрик.
-Обязанности:
-- Обновление статусов задач и шагов в orchestrator.orchestrator_tasks / _steps.
-- Сохранение метрик LLM-запросов в metrics.llm_internal.
-- Сохранение полных текстовых артефактов LLM (messages, raw response, final params) в metrics.llm_artifacts.
-- Сохранение рассуждений (Chain of Thought) в orchestrator.reasonings.
-- Привязка рассуждений и метрик к шагам оркестратора.
-Архитектура:
-Все функции принимают ID и данные, выполняют SQL-запросы и возвращают ID или None.
+Центральный сервис телеметрии, метрик и управления состоянием оркестратора.
+Выступает единой точкой входа для всех записей в таблицы orchestrator.* и metrics.*.
+
+Основные возможности:
+1. Управление жизненным циклом задач и шагов:
+   - mark_task_running / complete_task_success / complete_task_error.
+   - create_orchestrator_step / complete_step_success / complete_step_error.
+   - Автоматический расчет латентности (run_latency, total_latency) через SQL EXTRACT(EPOCH).
+2. Сохранение метрик LLM (с ветвлением по провайдерам):
+   - save_llm_metrics: для внутренних провайдеров (local_llama) → metrics.llm_internal.
+   - save_llm_external_metrics: для внешних API (DashScope) → metrics.llm_external.
+   - save_emb_metrics: для сервера эмбеддингов → metrics.emb_internal.
+3. Запись артефактов и рассуждений (Chain-of-Thought):
+   - save_llm_artifacts: сохранение полных промптов, ответов и параметров в JSONB.
+   - save_reasoning: сохранение текста рассуждений модели в orchestrator.reasonings.
+4. Связывание сущностей:
+   - Привязка метрик и рассуждений к конкретным шагам оркестратора (set_step_*).
+5. Восстановление после сбоев (Crash Recovery):
+   - close_dangling_orchestrator_records: при старте системы переводит все "зависшие" 
+     задачи и шаги (pending/running) в статус failed, предотвращая блокировку очереди.
+
+Архитектурные принципы:
+- Все функции принимают ID и данные, выполняют атомарные SQL-запросы и возвращают ID или None.
+- Поддержка JSONB-полей через psycopg2.extras.Json.
+- Гибкая система привязки метрик к шагам: complete_step_* принимают опциональные 
+  llm_metric_id, llm_metric_external_id и metric_source для корректного маппинга.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __description__ = "Utility module for updating statuses and saving metrics"
 
 import logging
@@ -55,6 +72,7 @@ def mark_task_running(task_id: str) -> None:
             conn.commit()
     logger.debug("ЗTask %s is marked as running", task_id[:8])
 
+
 def complete_task_success(task_id: str, output_data: Optional[Dict[str, Any]] = None) -> None:
     """
     Завершает задачу успешно (status='completed').
@@ -78,6 +96,7 @@ def complete_task_success(task_id: str, output_data: Optional[Dict[str, Any]] = 
             """, (Json(output_data) if output_data else None, task_id))
             conn.commit()
     logger.info("Task %s completed successfully", task_id[:8])
+
 
 def complete_task_error(
         task_id: str,
@@ -111,6 +130,7 @@ def complete_task_error(
                 """, (error_module, error_message, task_id))
                 conn.commit()
         logger.warning("Task %s completed with error: %s", task_id[:8], error_message)
+
 
 def create_orchestrator_step(
     task_id: str,
@@ -170,10 +190,13 @@ def create_orchestrator_step(
     logger.debug("Step %s created for task %s (type: %s)", step_id[:8], task_id[:8], step_type_name)
     return step_id
 
+
 def complete_step_success(
     step_id: str,
     output_data: Optional[Dict[str, Any]] = None,
     llm_metric_id: Optional[str] = None,
+    llm_metric_external_id: Optional[str] = None,   # ← НОВОЕ
+    metric_source: Optional[str] = None,            # ← НОВОЕ
     emb_metric_id: Optional[str] = None
 ) -> None:
     """Завершает шаг оркестратора со статусом 'completed'."""
@@ -181,7 +204,6 @@ def complete_step_success(
     try:
         with psycopg2.connect(**db_config) as conn:
             with conn.cursor() as cur:
-                # Базовый UPDATE
                 cur.execute("""
                     UPDATE orchestrator.orchestrator_steps
                     SET status = 'completed'::task_status,
@@ -190,24 +212,29 @@ def complete_step_success(
                         latency = EXTRACT(EPOCH FROM (NOW() - created_at))
                     WHERE id = %s
                 """, (json.dumps(output_data or {}), step_id))
-                
-                # === НОВОЕ: Обновляем метрики, если переданы ===
-                if llm_metric_id or emb_metric_id:
-                    update_fields = []
-                    params = []
-                    if llm_metric_id:
-                        update_fields.append("llm_metric_id = %s::uuid")
-                        params.append(llm_metric_id)
-                    if emb_metric_id:
-                        update_fields.append("emb_metric_id = %s::uuid")
-                        params.append(emb_metric_id)
+
+                update_fields = []
+                params = []
+                if llm_metric_id:
+                    update_fields.append("llm_metric_id = %s::uuid")
+                    params.append(llm_metric_id)
+                if llm_metric_external_id:
+                    update_fields.append("llm_metric_external_id = %s::uuid")
+                    params.append(llm_metric_external_id)
+                if metric_source:
+                    update_fields.append("metric_source = %s::metric_source")
+                    params.append(metric_source)
+                if emb_metric_id:
+                    update_fields.append("emb_metric_id = %s::uuid")
+                    params.append(emb_metric_id)
+
+                if update_fields:
                     params.append(step_id)
                     cur.execute(f"""
                         UPDATE orchestrator.orchestrator_steps
                         SET {', '.join(update_fields)}
                         WHERE id = %s
                     """, params)
-                
                 conn.commit()
         logger.debug("Step %s completed successfully", step_id[:8])
     except Exception as e:
@@ -219,6 +246,8 @@ def complete_step_error(
     error_module: str,
     error_message: str,
     llm_metric_id: Optional[str] = None,
+    llm_metric_external_id: Optional[str] = None,   # ← НОВОЕ
+    metric_source: Optional[str] = None,            # ← НОВОЕ
     emb_metric_id: Optional[str] = None
 ) -> None:
     """Завершает шаг оркестратора со статусом 'failed'."""
@@ -236,29 +265,34 @@ def complete_step_error(
                         latency = EXTRACT(EPOCH FROM (NOW() - created_at))
                     WHERE id = %s
                 """, (error_module, error_message, step_id))
-                
-                # === НОВОЕ: Обновляем метрики, если переданы ===
-                if llm_metric_id or emb_metric_id:
-                    update_fields = []
-                    params = []
-                    if llm_metric_id:
-                        update_fields.append("llm_metric_id = %s::uuid")
-                        params.append(llm_metric_id)
-                    if emb_metric_id:
-                        update_fields.append("emb_metric_id = %s::uuid")
-                        params.append(emb_metric_id)
+
+                update_fields = []
+                params = []
+                if llm_metric_id:
+                    update_fields.append("llm_metric_id = %s::uuid")
+                    params.append(llm_metric_id)
+                if llm_metric_external_id:
+                    update_fields.append("llm_metric_external_id = %s::uuid")
+                    params.append(llm_metric_external_id)
+                if metric_source:
+                    update_fields.append("metric_source = %s::metric_source")
+                    params.append(metric_source)
+                if emb_metric_id:
+                    update_fields.append("emb_metric_id = %s::uuid")
+                    params.append(emb_metric_id)
+
+                if update_fields:
                     params.append(step_id)
                     cur.execute(f"""
                         UPDATE orchestrator.orchestrator_steps
                         SET {', '.join(update_fields)}
                         WHERE id = %s
                     """, params)
-                
                 conn.commit()
         logger.debug("Step %s marked as failed", step_id[:8])
     except Exception as e:
         logger.error("Failed to complete step error %s: %s", step_id[:8], e, exc_info=True)
-
+        
 # =============================================================================
 # === СОХРАНЕНИЕ МЕТРИК И РАССУЖДЕНИЙ ===
 # =============================================================================
@@ -459,41 +493,32 @@ def set_step_reasoning_id(step_id: str, reasoning_id: str) -> None:
 
 
 def save_llm_artifacts(
-    llm_metric_id: str,
+    llm_metric_id: Optional[str],          # ← был str, стал Optional
     orchestrator_step_id: Optional[str],
     messages: List[Dict[str, str]],
     raw_response: str,
-    final_params: Dict[str, Any]
+    final_params: Dict[str, Any],
+    llm_metric_external_id: Optional[str] = None,   # ← НОВОЕ
+    metric_source: str = "internal"                 # ← НОВОЕ
 ) -> str:
-    """
-    Сохраняет полные текстовые артефакты LLM-запроса для аналитики.
-    
-    Args:
-        llm_metric_id: UUID из metrics.llm_internal
-        orchestrator_step_id: UUID шага оркестратора
-        messages: Полный массив messages [{role, content}, ...]
-        raw_response: Сырой текстовый ответ модели
-        final_params: Фактически использованные параметры генерации
-        
-    Returns:
-        str: UUID созданной записи
-    """
+    """Сохраняет артефакты. llm_metric_id или llm_metric_external_id — в зависимости от metric_source."""
     db_config = load_postgres_config()
     with psycopg2.connect(**db_config) as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO metrics.llm_artifacts (
-                    llm_metric_id, orchestrator_step_id,
-                    messages_json, raw_response, final_params, agent_version
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    llm_metric_id, llm_metric_external_id, metric_source,
+                    orchestrator_step_id, messages_json, raw_response, final_params, agent_version
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
-                llm_metric_id, orchestrator_step_id,
+                llm_metric_id, llm_metric_external_id, metric_source,
+                orchestrator_step_id,
                 Json(messages), raw_response, Json(final_params), agent_version
             ))
             artifact_id = str(cur.fetchone()[0])
             conn.commit()
-    logger.debug(f"LLM artifacts saved: {artifact_id[:8]} (metric: {llm_metric_id[:8]})")
+    logger.debug("LLM artifacts saved: %s (source=%s)", artifact_id[:8], metric_source)
     return artifact_id
 
 
@@ -558,6 +583,58 @@ def save_emb_metrics(
             conn.commit()
             
     logger.debug("Emb metrics saved: %s (step: %s)", metric_id[:8], orchestrator_step_id[:8])
+    return metric_id
+
+
+def save_llm_external_metrics(
+    orchestrator_step_id: str,
+    prompt_id: str,
+    provider: str,
+    model: str,
+    param: Dict[str, Any],
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int,
+    host_nctx: int,
+    prompt_ms: float = 0.0,
+    prompt_per_token_ms: float = 0.0,
+    prompt_per_second: float = 0.0,
+    predicted_per_second: float = 0.0,
+    resp_time: float = 0.0,
+    net_latency: float = 0.0,
+    full_time: float = 0.0,
+    error_status: bool = False,
+    error_message: Optional[str] = None
+) -> str:
+    """Сохраняет метрики ВНЕШНЕГО LLM API в metrics.llm_external."""
+    db_config: dict = load_postgres_config()
+    with psycopg2.connect(**db_config) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO metrics.llm_external (
+                    orchestrator_step_id, prompt_id, provider, model, param,
+                    prompt_tokens, completion_tokens, total_tokens, host_nctx,
+                    prompt_ms, prompt_per_token_ms, prompt_per_second,
+                    predicted_per_second, resp_time, net_latency, full_time,
+                    error_status, error_message, error_time,
+                    agent_version, timestamp
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                )
+                RETURNING id
+            """, (
+                orchestrator_step_id, prompt_id, provider, model, Json(param),
+                prompt_tokens, completion_tokens, total_tokens, host_nctx,
+                prompt_ms, prompt_per_token_ms, prompt_per_second,
+                predicted_per_second, resp_time, net_latency, full_time,
+                error_status, error_message,
+                datetime.now(timezone.utc) if error_status else None,
+                agent_version
+            ))
+            metric_id = str(cur.fetchone()[0])
+            conn.commit()
+    logger.debug("External LLM metrics saved: %s (provider=%s)", metric_id[:8], provider)
     return metric_id
 
 
