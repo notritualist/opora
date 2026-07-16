@@ -1,19 +1,26 @@
 """
 main-srv/src/orchestrator/response_composer.py
 
-Модуль генерации финального ответа пользователю.
-Логика:
-1. Получение сообщения пользователя из БД.
-2. Получение системного промпта и параметров генерации из orchestrator.prompts.
-3. Сборка истории диалога (последние N сообщений согласно HISTORY_MESSAGE_LIMIT).
-4. Расчёт лимитов токенов и обрезка истории при переполнении контекста.
-5. Вызов ModelService.generate().
-6. Сохранение полных артефактов в metrics.llm_artifacts.
-7. Сохранение ответа в dialogs.row_messages.
-8. Завершение задачи и шага оркестратора.
+Композер генерации финального ответа пользователю (user_answer_generation).
+
+Логика пайплайна:
+1. Загрузка сообщения пользователя и ID активного диалога.
+2. Интеграция с Preprocessing Pipeline:
+   - Чтение retrieval_log_id из сообщения.
+   - Загрузка raw_content из memory.retrieval_logs.
+   - Инъекция блока "<Контекст из базы знаний>" в системный промпт 
+     (после тега </Правила>, чтобы не ломать префикс-кэш).
+3. Сборка контекста:
+   - Формирование истории диалога (последние N сообщений).
+   - Расчет токенов (n_ctx - max_tokens - 10% safety margin).
+   - Обрезка истории (удаление самых старых сообщений) при переполнении контекста.
+4. Вызов LLM и сохранение результатов:
+   - Генерация через ModelService (с поддержкой reasoning_content).
+   - Сохранение метрик (ветвление на internal/external провайдеры).
+   - Запись ответа в dialogs.row_messages с расчетом answer_latency.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __description__ = "Module for generating the final response to the user"
 
 
@@ -38,8 +45,10 @@ from services.service_metrics import (
     save_reasoning,
     set_step_reasoning_id,
     save_llm_artifacts,
+    save_llm_external_metrics
 )
 from version import __version__ as agent_version
+from services.datetime_context import build_time_block
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +66,22 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_TOKENS: int = 65536
 CONTEXT_SAFETY_MARGIN_PERCENT: float = 0.9  # 10% запас
 HISTORY_MESSAGE_LIMIT: int = 15
+
+
+# =============================================================================
+# === ВЫБОР ПРОМПТА (ручное переключение) =====================================
+# =============================================================================
+# False → agent_core_identity        (internal, локальная llama)
+# True  → agent_core_identity_external (external, DashScope API)
+# Меняй руками и перезапускай сервис.
+# =============================================================================
+USE_EXTERNAL_PROMPT: bool = True
+
+PROMPT_NAME_INTERNAL: str = 'agent_core_identity'
+PROMPT_NAME_EXTERNAL: str = 'agent_core_identity_external'
+
+METRIC_SOURCE_INTERNAL: str = 'internal'
+METRIC_SOURCE_EXTERNAL: str = 'external'
 
 def _build_history_context(db_config: dict, session_id: str, current_message_id: str) -> tuple[list[dict], list[str]]: 
     """
@@ -89,6 +114,89 @@ def _build_history_context(db_config: dict, session_id: str, current_message_id:
 
             return messages, message_ids
 
+
+def _load_retrieved_knowledge(db_config: dict, retrieval_log_id: Optional[str]) -> Optional[str]:
+    """
+    Загружает raw_content из memory.retrieval_logs по UUID лога.
+    Graceful degradation: если лог отсутствует или пустой — возвращает None.
+    
+    Args:
+        db_config: параметры подключения к PostgreSQL
+        retrieval_log_id: UUID записи в memory.retrieval_logs
+    
+    Returns:
+        str | None: raw_content или None
+    """
+    if not retrieval_log_id:
+        return None
+    try:
+        with psycopg2.connect(**db_config) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT raw_content, nodes_count, total_tokens, strategy, error_message
+                    FROM memory.retrieval_logs
+                    WHERE id = %s
+                """, (retrieval_log_id,))
+                row = cur.fetchone()
+                if not row:
+                    logger.warning("Retrieval log %s not found", str(retrieval_log_id)[:8])
+                    return None
+                raw_content, nodes_count, total_tokens, strategy, error_message = row
+                if error_message:
+                    logger.warning("Retrieval log %s has error: %s", str(retrieval_log_id)[:8], error_message[:200])
+                    return None
+                if not raw_content or not raw_content.strip():
+                    logger.debug("Retrieval log %s has empty raw_content", str(retrieval_log_id)[:8])
+                    return None
+                logger.info(
+                    "Knowledge loaded from retrieval log %s: nodes=%d, tokens=%d, strategy=%s",
+                    str(retrieval_log_id)[:8], nodes_count, total_tokens, strategy
+                )
+                return raw_content
+    except Exception as exc:
+        logger.warning("Failed to load retrieval log %s: %s", str(retrieval_log_id)[:8] if retrieval_log_id else "None", exc)
+        return None
+
+
+def _inject_knowledge_into_system_prompt(
+    system_prompt: str,
+    knowledge_content: str
+) -> str:
+    """
+    Инъецирует блок знаний в конец системного промпта.
+    
+    Блок добавляется после закрывающего тега </Правила> (если он есть),
+    либо в самый конец промпта. Это не ломает структуру исходного промпта
+    и позволяет LLM чётко отделить правила поведения от фактического контекста.
+    
+    Args:
+        system_prompt: исходный текст системного промпта
+        knowledge_content: raw_content из memory.retrieval_logs
+    
+    Returns:
+        str: модифицированный системный промпт с блоком знаний
+    """
+    knowledge_block = (
+        "\n\n<Контекст из базы знаний>\n"
+        "Ниже приведены проверенные факты из моей базы знаний, релевантные вопросу собеседника.\n"
+        "Используй их как ПРИОРИТЕТНЫЙ источник информации для ответа.\n\n"
+        f"{knowledge_content}\n\n"
+        "ПРАВИЛА РАБОТЫ С КОНТЕКСТОМ:\n"
+        "- Если факт из контекста прямо отвечает на вопрос — опирайся на него.\n"
+        "- Если факты противоречат вопросу собеседника — вежливо укажи на расхождение, ссылаясь на контекст.\n"
+        "- Если в контексте НЕТ информации для ответа — прямо сообщи: «В моей базе знаний нет данных по этому вопросу».\n"
+        "- Не дополняй ответ выдуманными фактами, если их нет в контексте.\n"
+        "</Контекст из базы знаний>\n"
+    )
+    
+    # Вставляем блок после закрывающего тега </Правила>, если он есть
+    if "</Правила>" in system_prompt:
+        return system_prompt.replace("</Правила>", f"</Правила>{knowledge_block}")
+    
+    # Fallback: добавляем в самый конец
+    return system_prompt + knowledge_block
+
+
 def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     """
     Генерирует финальный ответ пользователю.
@@ -116,7 +224,7 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     with psycopg2.connect(**db_config) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, row_text, session_id, actor_id, timestamp
+                SELECT id, row_text, session_id, actor_id, timestamp, retrieval_log_id
                 FROM dialogs.row_messages
                 WHERE id = %s
             """, (message_id,))
@@ -126,13 +234,15 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
                 logger.error(error_msg)
                 complete_task_error(task_id, error_module="response_composer", error_message=error_msg)
                 return
-
             user_content = msg["row_text"]
             session_id = msg["session_id"]
             user_actor_id = msg["actor_id"]
             user_msg_timestamp = msg["timestamp"]
-
-            logger.debug(f"Loaded user message {message_id[:8]} from session {session_id[:8]}")
+            retrieval_log_id = msg.get("retrieval_log_id")
+            logger.debug(
+                f"Loaded user message {message_id[:8]} from session {session_id[:8]}, "
+                f"retrieval_log={str(retrieval_log_id)[:8] if retrieval_log_id else 'None'}"
+            )
 
     # === 1.1 Получаем ID активного диалога ===
     from dialog_services.dialogue_manager import ensure_active_dialogue
@@ -145,31 +255,50 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
     )
     logger.debug(f"Active dialogue ID: {dialogue_id[:8]}")
 
+    # === 1.2 Выбор промпта по константе ===
+    prompt_name = PROMPT_NAME_EXTERNAL if USE_EXTERNAL_PROMPT else PROMPT_NAME_INTERNAL
+    metric_source = METRIC_SOURCE_EXTERNAL if USE_EXTERNAL_PROMPT else METRIC_SOURCE_INTERNAL
+    logger.info("Using prompt '%s' (metric_source=%s, USE_EXTERNAL_PROMPT=%s)",
+                prompt_name, metric_source, USE_EXTERNAL_PROMPT)
+
     # === 2. Загрузка промпта и параметров генерации ===
     with psycopg2.connect(**db_config) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Ищем актуальный системный промпт (testing или active)
             cur.execute("""
                 SELECT id, text, params
                 FROM orchestrator.prompts
-                WHERE name = 'agent_core_identity'
-                  AND status IN ('testing'::prompt_status, 'active'::prompt_status)
+                WHERE name = %s
+                AND status IN ('testing'::prompt_status, 'active'::prompt_status)
                 ORDER BY created_at DESC
                 LIMIT 1
-            """)
+            """, (prompt_name,))
             prompt = cur.fetchone()
             if not prompt:
-                error_msg = "Prompt 'agent_core_identity' not found in database"
+                error_msg = f"Prompt '{prompt_name}' not found in database"
                 logger.error(error_msg)
                 complete_task_error(task_id, error_module="response_composer", error_message=error_msg)
                 return
-
             prompt_id = prompt["id"]
             raw_system_prompt = prompt["text"]
             model_params = prompt["params"] or {}
     
-    # === 3. Системный промпт (в V001 без плейсхолдеров) ===
-    system_prompt = raw_system_prompt
+    # === 3. Системный промпт с интеграцией знаний из графа ===
+    # Инъецируем время в конец. Тег </Правила> остается на месте, 
+    # поэтому префикс-кэш статической части промпта не ломается.
+    system_prompt = raw_system_prompt + build_time_block("response")
+
+    # Загружаем знания, собранные preprocessing pipeline
+    knowledge_content = _load_retrieved_knowledge(db_config, retrieval_log_id)
+    knowledge_injected = False
+    if knowledge_content:
+        system_prompt = _inject_knowledge_into_system_prompt(system_prompt, knowledge_content)
+        knowledge_injected = True
+        logger.info(
+            "Knowledge block injected into system prompt (%d chars)",
+            len(knowledge_content)
+        )
+    else:
+        logger.debug("No knowledge available — using base system prompt only")
     
     # === 4. Формирование контекста (только история) ===
     history_messages, history_message_ids = _build_history_context(db_config, session_id, message_id)
@@ -241,6 +370,8 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         "token_count": total_input_tokens,
         "history_messages_count": len(history_messages),
         "history_message_ids": history_message_ids,
+        "retrieval_log_id": str(retrieval_log_id) if retrieval_log_id else None,
+        "knowledge_injected": knowledge_injected,
     }
     step_id = create_orchestrator_step(
         task_id=task_id,
@@ -321,35 +452,62 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
             set_step_reasoning_id(step_id, reasoning_id)
             logger.debug(f"Reasoning saved: {reasoning_id[:8]}")
 
-    # === 10. Запись метрик LLM ===
+    # === 10. Запись метрик LLM (ветвление по metric_source) ===
     metrics = result.get("metrics", {})
     timings = metrics.get("timings", {})
     usage = metrics.get("usage", {})
+    provider_name = model.get_model_info(model_name).get("provider", "local_llama")
 
-    llm_metric_id = save_llm_metrics(
-        orchestrator_step_id=step_id,
-        prompt_id=prompt_id,
-        host="main-srv",
-        model=metrics.get("model", "unknown"),
-        param=model_params,
-        cache_n=timings.get("cache_n", 0),
-        prompt_tokens=usage.get("prompt_tokens", 0),
-        completion_tokens=usage.get("completion_tokens", 0),
-        total_tokens=usage.get("total_tokens", 0),
-        host_nctx=metrics.get("host_nctx", 0),
-        prompt_ms=timings.get("prompt_ms", 0.0),
-        prompt_per_token_ms=timings.get("prompt_per_token_ms", 0.0),
-        prompt_per_second=timings.get("prompt_per_second", 0.0),
-        predicted_per_second=timings.get("predicted_per_second", 0.0),
-        resp_time=timings.get("predicted_ms", 0.0) / 1000,
-        net_latency=0.0,
-        full_time=0.0,
-        error_status=False
-    )
+    llm_metric_id = None
+    llm_metric_external_id = None
+
+    if metric_source == METRIC_SOURCE_EXTERNAL:
+        llm_metric_external_id = save_llm_external_metrics(
+            orchestrator_step_id=step_id,
+            prompt_id=prompt_id,
+            provider=provider_name,
+            model=metrics.get("model", model_name),
+            param=model_params,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            host_nctx=metrics.get("host_nctx", 0),
+            prompt_ms=timings.get("prompt_ms", 0.0),
+            prompt_per_token_ms=timings.get("prompt_per_token_ms", 0.0),
+            prompt_per_second=timings.get("prompt_per_second", 0.0),
+            predicted_per_second=timings.get("predicted_per_second", 0.0),
+            resp_time=timings.get("predicted_ms", 0.0) / 1000,
+            net_latency=0.0,
+            full_time=0.0,
+            error_status=False
+        )
+    else:
+        llm_metric_id = save_llm_metrics(
+            orchestrator_step_id=step_id,
+            prompt_id=prompt_id,
+            host="main-srv",
+            model=metrics.get("model", "unknown"),
+            param=model_params,
+            cache_n=timings.get("cache_n", 0),
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            total_tokens=usage.get("total_tokens", 0),
+            host_nctx=metrics.get("host_nctx", 0),
+            prompt_ms=timings.get("prompt_ms", 0.0),
+            prompt_per_token_ms=timings.get("prompt_per_token_ms", 0.0),
+            prompt_per_second=timings.get("prompt_per_second", 0.0),
+            predicted_per_second=timings.get("predicted_per_second", 0.0),
+            resp_time=timings.get("predicted_ms", 0.0) / 1000,
+            net_latency=0.0,
+            full_time=0.0,
+            error_status=False
+        )
 
     # === 10.1 Сохранение артефактов (полный промпт + ответ + параметры) ===
     save_llm_artifacts(
         llm_metric_id=llm_metric_id,
+        llm_metric_external_id=llm_metric_external_id,
+        metric_source=metric_source,
         orchestrator_step_id=step_id,
         messages=messages,
         raw_response=clean_response,
@@ -410,22 +568,22 @@ def compose_final_response(task_id: str, input_data: Dict[str, Any]) -> None:
         complete_task_error(task_id, error_module="response_composer", error_message=str(e))
         return
 
-    # === 13. Привязка метрик к шагу оркестратора ===
-    # llm_metric_id хранится в orchestrator.orchestrator_steps, а не в сообщениях
-    try:
-        with psycopg2.connect(**db_config) as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE orchestrator.orchestrator_steps SET llm_metric_id = %s WHERE id = %s", (llm_metric_id, step_id))
-                conn.commit()
-    except Exception as e:
-        logger.warning(f"Failed to link llm_metric_id to step: {e}")
-
-    # === 14. Завершение шага и задачи ===
+    # === 13. Завершение шага и задачи ===
     step_output = {
         "response_message_id": response_id,
         "llm_metric_id": llm_metric_id,
+        "llm_metric_external_id": llm_metric_external_id,
+        "metric_source": metric_source,
         "reasoning_id": reasoning_id
     }
-    complete_step_success(step_id, output_data=step_output)
+
+    complete_step_success(
+        step_id,
+        output_data=step_output,
+        llm_metric_id=llm_metric_id,                # ← для internal (local_llama)
+        llm_metric_external_id=llm_metric_external_id,  # ← для external (dashscope)
+        metric_source=metric_source,                # ← 'internal' или 'external'
+    )
+
     complete_task_success(task_id, output_data=step_output)
     logger.info(f"Task {task_id[:8]} and step {step_id[:8]} completed successfully")

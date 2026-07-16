@@ -1,21 +1,23 @@
 """
 main-srv/src/services/emb_service.py
 
-Сервис управления векторизацией узлов графа знаний (memory.graph_nodes).
+Сервис управления векторизацией узлов графа знаний и взаимодействия с emb-srv.
 
-Задачи модуля:
-1. Создание задач оркестратора для векторизации узлов графа:
-   - graph_node_vectorize (приоритет 0.2)
-2. Обработка задач векторизации:
-   - Чтение description узла из БД
-   - Проверка длины текста с учётом буфера для технических параметров
-   - Отправка запроса на emb-srv
-   - Сохранение метрик в БД
-   - Сохранение вектора в Qdrant через qdrant_manager
-   - Обновление ссылок qdrant_point_id и emb_metric_id в memory.graph_nodes
+Основные возможности:
+1. Клиент emb-srv:
+   - Загрузка конфигурации из emb_srv_config.yaml (с fallback на localhost).
+   - HTTP-запросы к эндпоинту /embed с валидацией размерности вектора (EMBEDDING_DIMENSION).
+   - Обработка таймаутов и сетевых ошибок.
+2. Подготовка данных:
+   - Извлечение текста для векторизации (приоритет: description → display_name + entity_slug).
+   - Проверка длины текста в токенах (лимит EMB_SRV_MAX_CONTEXT).
+3. Обработчик задачи (vectorize_graph_node):
+   - Пошаговое выполнение: валидация → вызов emb-srv → сохранение метрик → upsert в Qdrant.
+   - Обновление ссылок emb_metric_id и qdrant_point_id в memory.graph_nodes.
+4. Создание задач оркестратора (create_graph_node_vectorize_task).
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __description__ = "Сервис векторизации узлов графа знаний (memory.graph_nodes)"
 
 import logging
@@ -502,7 +504,8 @@ def vectorize_graph_node(task_id: str, input_data: Dict[str, Any]) -> None:
         received_at=datetime.fromisoformat(params_info["received_at"]) if params_info.get("received_at") else None,
         sent_at=datetime.fromisoformat(params_info["sent_at"]) if params_info.get("sent_at") else None,
         full_time=params_info.get("duration_sec", 0.0),
-        error_status=False
+        error_status=False,
+        agent_version=agent_version 
     )
     logger.debug("Метрики эмбеддинга сохранены: %s", emb_metric_id[:8])
 
@@ -533,20 +536,11 @@ def vectorize_graph_node(task_id: str, input_data: Dict[str, Any]) -> None:
     if vector is not None:
         metadata = get_graph_node_metadata(node_id, db_config)
 
-        # qdrant_manager строго требует domain_id и topic_id для фильтрации.
-        # Если узел ещё не классифицирован, пропускаем upsert без краша задачи.
-        if not metadata or not metadata.get("domain_id") or not metadata.get("topic_id"):
-            logger.warning(
-                "⏭ Пропуск сохранения в Qdrant для узла %s: отсутствуют domain_id или topic_id",
-                node_id[:8]
-            )
-        else:
+        if metadata:
             try:
                 qdrant_point_id = upsert_graph_node_vector(
                     vector=vector,
                     postgres_node_id=node_id,
-                    domain_id=str(metadata["domain_id"]),
-                    topic_id=str(metadata["topic_id"]),
                     actor_id=metadata.get("actor_id")
                 )
             except Exception as e:

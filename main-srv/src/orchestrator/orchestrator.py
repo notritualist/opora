@@ -1,35 +1,26 @@
 """
 main-srv/src/orchestrator/orchestrator.py
 
-Главный цикл оркестратора задач AGI.
-Возможности:
-- Одиночный фоновый поток с безопасным получением задач (FOR UPDATE SKIP LOCKED).
-- Контроль параллелизма: одна задача за раз через флаг _composer_busy.
-- Проверка зависимостей: задачи с parent_task_id ждут завершения родителя.
-- Интеграция с жизненным циклом: проверка таймаутов неактивности и диалогов.
-- Автоматическое планирование фоновых задач в режиме sleep (memory_extraction, verification_proposal).
+Главный фоновый цикл (Daemon) оркестратора задач AGI.
 
-Обработчики задач:
-- user_answer_generation → response_composer.py
-- memory_extraction → memory_composer.py
-- verification_proposal → verification_composer.py (инициация верификации через NOTIFY)
-- hypothesis_refinement → verification_composer.py (LLM-уточнение)
-- graph_update → graph_composer.py
-- graph_route_and_create → graph_route_composer.py
-- graph_merge_resolve → graph_merge_composer.py
-- graph_relation_linker → graph_linker_composer.py
-- graph_summarize → graph_summarize_composer.py
+Архитектура и гарантии:
+1. Безопасная выборка: использует FOR UPDATE SKIP LOCKED для предотвращения дублирования.
+2. Контроль параллелизма: флаг _composer_busy и threading.Lock гарантируют, 
+   что одновременно выполняется только одна LLM-задача (защита от перегрузки модели).
+3. Зависимости: задачи с parent_task_id пропускаются, если родитель не в статусе 'completed'.
+4. Диспетчеризация: маппинг type_name → handler (тонкие обёртки над композерами).
 
-Архитектура:
-- Оркестратор работает как daemon-поток, запускаемый из main.py.
-- Задачи создаются через orchestrator_entry.
-- Обработчики — тонкие обёртки, делегирующие работу в композеры:
-  * user_answer_generation → response_composer.py
-  * memory_extraction → memory_composer.py
-- Метрики обновляются через service_metrics.
+Фоновое планирование (в состоянии sleep):
+- Автоматический запуск memory_extraction, topic/form_classification, verification_proposal.
+- Запуск граф-пайплайна (graph_route_and_create) с жесткими защитами:
+  1) Не запускается, если активна сессия верификации.
+  2) Соблюдается интервал (graph_pipeline_interval_minutes).
+  3) Проверяется наличие подтвержденных гипотез без графа.
+  4) Проверяется отсутствие незавершенных шагов графа.
+- Периодический запуск entity_clustering с проверкой отсутствия активных LLM-задач.
 """
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 __description__ = "AGI Agent Task Orchestrator"
 
 import threading
@@ -119,6 +110,29 @@ def _get_pending_task(db_config: dict, task_type_name: str):
                     return None
             
             return task
+
+
+def _handle_question_preprocessing(task_id: str, input_data: dict) -> None:
+    """
+    Обработчик преданализа вопроса пользователя.
+    Выполняет два последовательных шага:
+    1) question_routing — LLM-предразбор доменов/тем
+    2) knowledge_retrieval — выборка и сборка контекста из графа
+    """
+    global _composer_busy
+    try:
+        from preprocessing.pipeline import run_question_preprocessing
+        run_question_preprocessing(task_id=task_id, input_data=input_data)
+    except Exception as exc:
+        logger.exception("Error in question_preprocessing (task_id=%s): %s", task_id[:8], exc)
+        complete_task_error(
+            task_id=task_id,
+            error_module="preprocessing.pipeline",
+            error_message=str(exc)
+        )
+    finally:
+        with _composer_lock:
+            _composer_busy = False
 
 
 def _handle_answer_generation(task_id: str, input_data: dict) -> None:
@@ -217,6 +231,20 @@ def _handle_topic_classification(task_id: str, input_data: dict) -> None:
             _composer_busy = False
 
 
+def _handle_form_classification(task_id: str, input_data: dict) -> None:
+    """Обработчик задачи классификации гипотез по формам сущностей."""
+    global _composer_busy
+    try:
+        from memory_service.form_composer import compose_form_classification
+        compose_form_classification(task_id=task_id, input_data=input_data)
+    except Exception as exc:
+        logger.exception("Error in form_classification (task=%s): %s", task_id[:8], exc)
+        complete_task_error(task_id, "form_composer", str(exc))
+    finally:
+        with _composer_lock:
+            _composer_busy = False
+
+
 def _handle_graph_route(task_id: str, input_data: dict) -> None:
     global _composer_busy
     try:
@@ -265,6 +293,31 @@ def _handle_graph_summarize(task_id: str, input_data: dict) -> None:
         with _composer_lock: _composer_busy = False
 
 
+def _handle_entity_clustering(task_id: str, input_data: dict) -> None:
+    global _composer_busy
+    try:
+        from memory_service.entity_clustering_composer import compose_entity_clustering
+        compose_entity_clustering(task_id, input_data)
+    except Exception as exc:
+        logger.exception("Error in entity_clustering (task_id=%s): %s", task_id[:8], exc)
+        complete_task_error(task_id, "entity_clustering_composer", str(exc))
+    finally:
+        with _composer_lock:
+            _composer_busy = False
+
+def _handle_entity_binding(task_id: str, input_data: dict) -> None:
+    global _composer_busy
+    try:
+        from memory_service.entity_binding_composer import compose_entity_binding
+        compose_entity_binding(task_id, input_data)
+    except Exception as exc:
+        logger.exception("Error in entity_binding (task_id=%s): %s", task_id[:8], exc)
+        complete_task_error(task_id, "entity_binding_composer", str(exc))
+    finally:
+        with _composer_lock:
+            _composer_busy = False           
+
+
 def _get_task_type_name(db_config: dict, task_id: str) -> str:
     """Возвращает type_name задачи по её ID."""
     with psycopg2.connect(**db_config) as conn:
@@ -294,7 +347,8 @@ def load_pulse_seconds(db_config: dict) -> int:
     except Exception:
         logger.warning("Failed to load orchestrator_pulse_seconds from DB, using default=1")
         return 1
-    
+
+
 def _has_active_task_of_type(cur, type_name: str) -> bool:
     """
     Строгая проверка: существует ли задача указанного типа в статусах pending/running.
@@ -385,7 +439,20 @@ def _orchestrator_loop(lifecycle_mgr: LifecycleManager):
                                     schedule_topic_classification(priority=0.4)
                                     logger.info("Scheduled topic_classification: unclassified drafts found")
 
-                            # === 3. verification_proposal (если есть needs_clarification и нет активной сессии) ===
+                            # === 3. form_classification (если есть draft/needs_clarification без form_code) ===
+                            if not _has_active_task_of_type(cur, 'form_classification'):
+                                cur.execute("""
+                                    SELECT 1 FROM memory.hypotheses
+                                    WHERE status IN ('draft'::memory.hypothesis_status, 'needs_clarification'::memory.hypothesis_status)
+                                    AND form_code IS NULL
+                                    LIMIT 1
+                                """)
+                                if cur.fetchone():
+                                    from orchestrator.orchestrator_entry import schedule_form_classification
+                                    schedule_form_classification(priority=0.35)
+                                    logger.info("Scheduled form_classification: unclassified forms found")
+
+                            # === 4. verification_proposal (если есть needs_clarification и нет активной сессии) ===
                             if not _has_active_task_of_type(cur, 'verification_proposal'):
                                 cur.execute("""
                                     SELECT 1 FROM memory.verification_sessions
@@ -404,49 +471,145 @@ def _orchestrator_loop(lifecycle_mgr: LifecycleManager):
                                         schedule_verification_proposal(priority=0.2)
                                         logger.info("Scheduled verification_proposal: needs_clarification found")
 
-                            # === 4. GRAPH PIPELINE — ТОЛЬКО ПЕРВЫЙ ШАГ ===
-                            # Планировщик создаёт ТОЛЬКО graph_route_and_create.
-                            # Остальные шаги (merge → linker → summarize) создаются
-                            # автоматически предыдущими композерами через parent_task_id.
+                            # === 5. GRAPH PIPELINE — ТОЛЬКО ПЕРВЫЙ ШАГ ===
                             if not _has_active_task_of_type(cur, 'graph_route_and_create'):
-                                # Проверяем: есть ли вообще работа для пайплайна?
+                                # === ЗАЩИТА 1: Не запускать если активна верификация гипотез ===
                                 cur.execute("""
-                                    SELECT 1 FROM memory.hypotheses
-                                    WHERE status = 'confirmed'::memory.hypothesis_status
-                                    AND graph_merge_status = 'none'
-                                    AND topic_id IS NOT NULL
+                                    SELECT 1 FROM memory.verification_sessions
+                                    WHERE status = 'active'::memory.verification_session_status
                                     LIMIT 1
                                 """)
-                                if cur.fetchone():
-                                    # Дополнительная защита: не запускаем, если уже есть
-                                    # задачи следующих этапов в работе (пайплайн ещё не закончился)
+                                verification_active = cur.fetchone() is not None
+                                
+                                if not verification_active:
+                                    # === ЗАЩИТА 2: Проверка интервала с последнего запуска ===
                                     cur.execute("""
-                                        SELECT 1 FROM orchestrator.orchestrator_tasks t
+                                        SELECT t.completed_at FROM orchestrator.orchestrator_tasks t
                                         JOIN orchestrator.task_types tt ON t.task_type_id = tt.id
-                                        WHERE tt.type_name IN ('graph_merge_resolve', 'graph_relation_linker', 'graph_summarize')
-                                        AND t.status IN ('pending'::task_status, 'running'::task_status)
+                                        WHERE tt.type_name = 'graph_route_and_create'
+                                        AND t.status = 'completed'::task_status
+                                        ORDER BY t.completed_at DESC
                                         LIMIT 1
                                     """)
-                                    if not cur.fetchone():
-                                        from orchestrator.orchestrator_entry import schedule_graph_route_and_create
-                                        # dialogue_id=None — композер сам выберет все confirmed гипотезы
-                                        schedule_graph_route_and_create(dialogue_id=None, priority=0.4)
-                                        logger.info("Scheduled graph_route_and_create: pipeline started")
+                                    last_run = cur.fetchone()
+                                    should_run = True
+                                    
+                                    if last_run and last_run[0]:
+                                        cur.execute(
+                                            "SELECT value_float FROM state.settings WHERE param_name = 'graph_pipeline_interval_minutes'"
+                                        )
+                                        interval_row = cur.fetchone()
+                                        interval_min = interval_row[0] if interval_row and interval_row[0] else 30.0
+                                        
+                                        if interval_min > 0:
+                                            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+                                            last_completed = last_run[0]
+                                            if last_completed.tzinfo is None:
+                                                last_completed = last_completed.replace(tzinfo=_tz.utc)
+                                            elapsed = _dt.now(_tz.utc) - last_completed
+                                            should_run = elapsed >= _td(minutes=interval_min)
+                                    
+                                    if should_run:
+                                        # === ЗАЩИТА 3: Есть ли вообще работа? ===
+                                        cur.execute("""
+                                            SELECT 1 FROM memory.hypotheses
+                                            WHERE status = 'confirmed'::memory.hypothesis_status
+                                            AND graph_merge_status = 'none'
+                                            AND topic_id IS NOT NULL
+                                            LIMIT 1
+                                        """)
+                                        if cur.fetchone():
+                                            # === ЗАЩИТА 4: Пайплайн ещё не закончился? ===
+                                            cur.execute("""
+                                                SELECT 1 FROM orchestrator.orchestrator_tasks t
+                                                JOIN orchestrator.task_types tt ON t.task_type_id = tt.id
+                                                WHERE tt.type_name IN ('graph_merge_resolve', 'graph_relation_linker', 'graph_summarize')
+                                                AND t.status IN ('pending'::task_status, 'running'::task_status)
+                                                LIMIT 1
+                                            """)
+                                            if not cur.fetchone():
+                                                from orchestrator.orchestrator_entry import schedule_graph_route_and_create
+                                                schedule_graph_route_and_create(dialogue_id=None, priority=0.4)
+                                                logger.info("Scheduled graph_route_and_create: pipeline started")
+                            
+                            # === 5.1 ENTITY CLUSTERING (периодический, без LLM-конкуренции) ===
+                            if not _has_active_task_of_type(cur, 'entity_clustering'):
+                                # Проверяем: нет ли активных LLM-задач (merge, linker, summarize, refinement)?
+                                cur.execute("""
+                                    SELECT 1 FROM orchestrator.orchestrator_tasks t
+                                    JOIN orchestrator.task_types tt ON t.task_type_id = tt.id
+                                    WHERE tt.type_name IN (
+                                        'graph_merge_resolve', 'graph_relation_linker', 
+                                        'graph_summarize', 'hypothesis_refinement'
+                                    )
+                                    AND t.status IN ('pending'::task_status, 'running'::task_status)
+                                    LIMIT 1
+                                """)
+                                has_llm_tasks = cur.fetchone() is not None
+                                
+                                if not has_llm_tasks:
+                                    # Проверяем интервал: когда последний раз запускали entity_clustering?
+                                    cur.execute("""
+                                        SELECT completed_at FROM orchestrator.orchestrator_tasks t
+                                        JOIN orchestrator.task_types tt ON t.task_type_id = tt.id
+                                        WHERE tt.type_name = 'entity_clustering'
+                                        AND t.status = 'completed'::task_status
+                                        ORDER BY t.completed_at DESC
+                                        LIMIT 1
+                                    """)
+                                    last_run = cur.fetchone()
+                                    should_run = False
+                                    
+                                    if not last_run or not last_run[0]:
+                                        should_run = True  # никогда не запускали
+                                    else:
+                                        # Загружаем интервал из настроек
+                                        cur.execute(
+                                            "SELECT value_float FROM state.settings WHERE param_name = 'entity_clustering_interval_minutes'"
+                                        )
+                                        interval_row = cur.fetchone()
+                                        interval_min = interval_row[0] if interval_row and interval_row[0] else 30.0
+                                        
+                                        if interval_min > 0:
+                                            from datetime import datetime, timezone, timedelta
+                                            last_completed = last_run[0]
+                                            if last_completed.tzinfo is None:
+                                                last_completed = last_completed.replace(tzinfo=timezone.utc)
+                                            elapsed = datetime.now(timezone.utc) - last_completed
+                                            should_run = elapsed >= timedelta(minutes=interval_min)
+                                    
+                                    if should_run:
+                                        # Проверяем: есть ли fact-узлы с needs_entity_binding=TRUE?
+                                        cur.execute("""
+                                            SELECT 1 FROM memory.graph_nodes
+                                            WHERE form_code = 'fact'
+                                            AND is_active = TRUE
+                                            AND needs_entity_binding = TRUE
+                                            LIMIT 1
+                                        """)
+                                        if cur.fetchone():
+                                            from orchestrator.orchestrator_entry import schedule_entity_clustering
+                                            schedule_entity_clustering(priority=0.15)
+                                            logger.info("Scheduled entity_clustering: unbound fact-nodes found")
 
                 except Exception as e:
                     logger.warning("Background scheduling failed: %s", e)
                             
             # === ДИСПЕТЧЕРИЗАЦИЯ ЗАДАЧ ===
             if not _composer_busy:
-                task = _get_pending_task(db_config, "user_answer_generation")
+                task = _get_pending_task(db_config, "question_preprocessing")      # НОВОЕ
+                if not task: task = _get_pending_task(db_config, "user_answer_generation")
                 if not task: task = _get_pending_task(db_config, "hypothesis_refinement")
                 if not task: task = _get_pending_task(db_config, "memory_extraction")
                 if not task: task = _get_pending_task(db_config, "topic_classification")
+                if not task: task = _get_pending_task(db_config, "form_classification")
                 if not task: task = _get_pending_task(db_config, "verification_proposal")
                 if not task: task = _get_pending_task(db_config, "graph_route_and_create")
                 if not task: task = _get_pending_task(db_config, "graph_merge_resolve")
                 if not task: task = _get_pending_task(db_config, "graph_relation_linker")
                 if not task: task = _get_pending_task(db_config, "graph_summarize")
+                if not task: task = _get_pending_task(db_config, "entity_clustering")
+                if not task: task = _get_pending_task(db_config, "entity_binding")
                 
                 if task:
                     task_id = task["id"]
@@ -459,15 +622,19 @@ def _orchestrator_loop(lifecycle_mgr: LifecycleManager):
                         _composer_busy = True
                     
                     handlers: Dict[str, Callable] = {
-                        "user_answer_generation": _handle_answer_generation,
-                        "memory_extraction": _handle_memory_extraction,
-                        "topic_classification": _handle_topic_classification,
-                        "verification_proposal": _handle_verification_proposal,
-                        "hypothesis_refinement": _handle_hypothesis_refinement,
-                        "graph_route_and_create": _handle_graph_route,
-                        "graph_merge_resolve": _handle_graph_merge,
-                        "graph_relation_linker": _handle_graph_linker,
-                        "graph_summarize": _handle_graph_summarize,
+                        "question_preprocessing":    _handle_question_preprocessing,   # НОВОЕ
+                        "user_answer_generation":    _handle_answer_generation,
+                        "memory_extraction":         _handle_memory_extraction,
+                        "topic_classification":      _handle_topic_classification,
+                        "verification_proposal":     _handle_verification_proposal,
+                        "hypothesis_refinement":     _handle_hypothesis_refinement,
+                        "graph_route_and_create":    _handle_graph_route,
+                        "graph_merge_resolve":       _handle_graph_merge,
+                        "graph_relation_linker":     _handle_graph_linker,
+                        "graph_summarize":           _handle_graph_summarize,
+                        "form_classification":       _handle_form_classification,
+                        "entity_clustering":         _handle_entity_clustering,
+                        "entity_binding":            _handle_entity_binding
                     }
                     
                     target = handlers.get(task_type)

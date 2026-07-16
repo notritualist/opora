@@ -1,31 +1,24 @@
 """
 main-srv/src/orchestrator/orchestrator_entry.py
 
-Входной интерфейс оркестратора.
-Единая точка входа для создания задач оркестратора.
-Все модули (session_manager, lifecycle_manager, memory_service, verification_service) должны использовать этот интерфейс вместо прямого SQL INSERT.
+Единая точка входа (Facade) для создания задач оркестратора.
+Централизует логику INSERT в orchestrator.orchestrator_tasks и валидацию типов задач.
 
-Поддерживаемые типы задач:
-- user_answer_generation: генерация финального ответа пользователю.
-- memory_extraction: извлечение гипотез из закрытых диалогов в долговременную память.
-- verification_proposal: проверка наличия draft-гипотез и отправка NOTIFY в UI.
-- hypothesis_refinement: LLM-уточнение гипотезы по комментарию пользователя.
-- schedule_graph_update: обновление графа знаний из подтверждённой гипотезы.
-- schedule_graph_route_and_create: создаёт задачу детерминированного роутинга и создания узлов графа памяти.
-- schedule_graph_merge_resolve: создаёт задачу LLM-разрешения слияний графа памяти.
-- schedule_graph_relation_linker: создаёт задачу фонового построения связей между узлами графа памяти внутри тем.
-- schedule_graph_summarize: создаёт задачу фонового сжатия описаний узлов графа памяти.
-
-Архитектура:
-- Универсальная функция create_orchestrator_task() с валидацией task_type.
-Специализированные обёртки: on_user_message, schedule_memory_extraction, schedule_verification_proposal, schedule_hypothesis_refinement.
-
-Интеграция с жизненным циклом:
-- Активность фиксируется с actor_id из сообщения.
-- Агент-версия передаётся глобально через version.py.
+Основные возможности:
+1. Конвейер обработки сообщений (on_user_message):
+   - Создает связку задач: question_preprocessing (родитель) → user_answer_generation (дочерняя).
+   - Гарантирует строгую последовательность через parent_task_id.
+   - Фиксирует активность пользователя в LifecycleManager.
+2. Планировщики фоновых задач (schedule_*):
+   - Предоставляет типизированные обёртки для memory_extraction, verification_proposal, 
+     hypothesis_refinement, graph_route_and_create, graph_merge_resolve, entity_clustering и др.
+   - Управляет приоритетами задач (например, ответ пользователю = 0.8, граф = 0.2-0.4).
+3. Интеграция:
+   - Все модули (UI, сессии, лайфцикл) используют этот файл вместо прямых SQL-запросов.
+   - Автоматическая подстановка текущей agent_version из version.py.
 """
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 __description__ = "Entry point for orchestrator"
 
 import logging
@@ -39,23 +32,24 @@ from version import __version__ as agent_version
 logger = logging.getLogger(__name__)
 
 
-def on_user_message(message_id: str) -> str:
+def on_user_message(message_id: str) -> tuple[str, str]:
     """
-    Создаёт задачу генерации ответа при получении сообщения пользователя.
+    Создаёт пару связанных задач: преданализ → генерация ответа.
+    answer_generation имеет parent_task_id = preprocessing_task_id,
+    что гарантирует выполнение строго после завершения преданализа.
     
-    Логика:
-    1. Создание задачи user_answer_generation с приоритетом 0.8.  
+    Returns:
+        tuple: (preprocessing_task_id, answer_task_id)
     """
     if not message_id or not isinstance(message_id, str):
         raise ValueError("Message_id must be a non-empty string")
 
     db_config = load_postgres_config()
     conn = None
-
     try:
         conn = psycopg2.connect(**db_config)
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # === 1. Получаем actor_id из сообщения ===
+            # === 1. Получаем actor_id ===
             cur.execute(
                 "SELECT actor_id FROM dialogs.row_messages WHERE id = %s",
                 (message_id,)
@@ -69,64 +63,70 @@ def on_user_message(message_id: str) -> str:
             lifecycle_mgr = LifecycleManager(db_config)
             lifecycle_mgr.record_activity(actor_id, 'user_activity')
 
-            # === 3. Получаем ID типа задачи ===
+            # === 3. ID типов задач ===
+            cur.execute(
+                "SELECT id FROM orchestrator.task_types WHERE type_name = %s",
+                ("question_preprocessing",)
+            )
+            prep_type_row = cur.fetchone()
+            if not prep_type_row:
+                raise RuntimeError("Task type 'question_preprocessing' not found. Apply V004 migration.")
+            prep_type_id = prep_type_row["id"]
+
             cur.execute(
                 "SELECT id FROM orchestrator.task_types WHERE type_name = %s",
                 ("user_answer_generation",)
             )
-            type_row = cur.fetchone()
-        
-            if not type_row:
-                raise RuntimeError(
-                    "Task type 'user_answer_generation' not found in orchestrator.task_types. "
-                    "Ensure V001 migration was applied."
-                )
+            gen_type_row = cur.fetchone()
+            if not gen_type_row:
+                raise RuntimeError("Task type 'user_answer_generation' not found.")
+            gen_type_id = gen_type_row["id"]
 
-            generation_type_id = type_row["id"]
-
-            # === 4. Создаём задачу ГЕНЕРАЦИИ ОТВЕТА ===
+            # === 4. Создаём preprocessing (родитель) ===
             cur.execute("""
                 INSERT INTO orchestrator.orchestrator_tasks (
-                    task_type_id,
-                    input_data,
-                    priority,
-                    status,
-                    agent_version,
-                    created_at
-                ) VALUES (
-                    %(task_type_id)s,
-                    %(input_data)s,
-                    %(priority)s,
-                    'pending',
-                    %(agent_version)s,
-                    NOW()
-                )
+                    task_type_id, input_data, priority, status, agent_version, created_at
+                ) VALUES (%(tid)s, %(data)s, %(prio)s, 'pending', %(ver)s, NOW())
                 RETURNING id
             """, {
-                "task_type_id": generation_type_id,
-                "input_data": Json({"message_id": message_id}),
-                "priority": 0.8,
-                "agent_version": agent_version
+                "tid": prep_type_id,
+                "data": Json({"message_id": message_id}),
+                "prio": QUESTION_PREPROCESSING_PRIORITY,
+                "ver": agent_version,
             })
-            generation_task_id = str(cur.fetchone()["id"])
+            prep_task_id = str(cur.fetchone()["id"])
+
+            # === 5. Создаём answer_generation с parent_task_id ===
+            cur.execute("""
+                INSERT INTO orchestrator.orchestrator_tasks (
+                    task_type_id, parent_task_id, input_data, priority, status, agent_version, created_at
+                ) VALUES (%(tid)s, %(parent)s, %(data)s, %(prio)s, 'pending', %(ver)s, NOW())
+                RETURNING id
+            """, {
+                "tid": gen_type_id,
+                "parent": prep_task_id,
+                "data": Json({"message_id": message_id}),
+                "prio": 0.8,
+                "ver": agent_version,
+            })
+            gen_task_id = str(cur.fetchone()["id"])
 
             conn.commit()
-
             logger.info(
-                f"Task created: generation={generation_task_id[:8]} (prio=0.8), "
-                f"activity recorded for actor {actor_id[:8]}"
+                f"Pipeline created: preprocessing={prep_task_id[:8]} → "
+                f"generation={gen_task_id[:8]} (actor={actor_id[:8]})"
             )
-            return generation_task_id
+            return prep_task_id, gen_task_id
 
     except psycopg2.Error as e:
         if conn:
             conn.rollback()
-        logger.error(f"Database error while creating orchestrator tasks: {e}", exc_info=True)
+        logger.error(f"Database error in on_user_message: {e}", exc_info=True)
         raise
     except Exception as e:
         if conn:
             conn.rollback()
-        logger.error(f"Unexpected error in orchestrator_entry: {e}", exc_info=True)
+        logger.error(f"Unexpected error in on_user_message: {e}", exc_info=True)
         raise
     finally:
         if conn:
@@ -310,6 +310,15 @@ def schedule_topic_classification(priority: float = 0.4) -> str:
             return task_id
 
 
+def schedule_form_classification(priority: float = 0.35) -> str:
+    """Планирует задачу классификации гипотез по формам."""
+    return create_orchestrator_task(
+        task_type_name="form_classification",
+        input_data={"limit": 200},
+        priority=priority
+    )
+
+
 def schedule_graph_route_and_create(dialogue_id: Optional[str] = None, priority: float = 0.4) -> str:
     """Создаёт задачу детерминированного роутинга и создания узлов графа памяти."""
     return create_orchestrator_task("graph_route_and_create", {"dialogue_id": dialogue_id}, priority)
@@ -328,3 +337,28 @@ def schedule_graph_relation_linker(priority: float = 0.2, parent_task_id: Option
 def schedule_graph_summarize(priority: float = 0.1, parent_task_id: Optional[str] = None) -> str:
     """Создаёт задачу фонового сжатия описаний узлов графа памяти."""
     return create_orchestrator_task("graph_summarize", {"mode": "pipeline"}, priority, parent_task_id=parent_task_id)
+
+
+# === Константа приоритета преданализа ===
+QUESTION_PREPROCESSING_PRIORITY = 0.9
+
+def schedule_question_preprocessing(message_id: str, priority: float = QUESTION_PREPROCESSING_PRIORITY) -> str:
+    """
+    Создаёт задачу преданализа вопроса пользователя (роутинг + выборка знаний).
+    Запускается из интерфейса сразу после получения сообщения, СТРО ДО user_answer_generation.
+    """
+    return create_orchestrator_task(
+        task_type_name="question_preprocessing",
+        input_data={"message_id": message_id},
+        priority=priority,
+    )
+
+
+def schedule_entity_clustering(priority: float = 0.15, parent_task_id: Optional[str] = None) -> str:
+    """Создаёт задачу батчевой кластеризации fact-узлов в entity-агрегаторы."""
+    return create_orchestrator_task("entity_clustering", {"mode": "auto"}, priority, parent_task_id=parent_task_id)
+
+
+def schedule_entity_binding(priority: float = 0.15, parent_task_id: Optional[str] = None) -> str:
+    """Создаёт задачу инкрементальной привязки fact-узлов к существующим entity."""
+    return create_orchestrator_task("entity_binding", {"mode": "auto"}, priority, parent_task_id=parent_task_id)
